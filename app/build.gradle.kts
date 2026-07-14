@@ -42,9 +42,9 @@ android {
 
 dependencies {
     implementation(files("libs/lib3mf-android.aar"))
-    implementation(files("libs/filament-v1.73.0-android.aar"))
-    implementation(files("libs/gltfio-v1.73.0-android.aar"))
-    implementation(files("libs/filament-utils-v1.73.0-android.aar"))
+    implementation(files("libs/filament-v1.74.0-android.aar"))
+    implementation(files("libs/gltfio-v1.74.0-android.aar"))
+    implementation(files("libs/filament-utils-v1.74.0-android.aar"))
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
