@@ -148,11 +148,11 @@ class MeshTransform private constructor(private val values: FloatArray) {
     }
 }
 
-fun List<PlacedMeshData>.detectPlatePreviews(): List<PlatePreview> {
+fun List<PlacedMeshData>.detectPlatePreviews(plateName: (Int) -> String = { "Plate $it" }): List<PlatePreview> {
     if (isEmpty()) return emptyList()
 
-    val explicitPlates = explicitPlatePreviews()
-    val clusteredPlates = clusterPlatePreviews()
+    val explicitPlates = explicitPlatePreviews(plateName)
+    val clusteredPlates = clusterPlatePreviews(plateName)
 
     val selected = when {
         explicitPlates.size >= 2 && explicitPlates.size >= clusteredPlates.size -> explicitPlates
@@ -211,17 +211,17 @@ fun List<PlacedMeshData>.arrangedForAllPreview(plates: List<PlatePreview>): List
     return arranged.map { it.translated(recenter) }
 }
 
-private fun List<PlacedMeshData>.explicitPlatePreviews(): List<PlatePreview> {
+private fun List<PlacedMeshData>.explicitPlatePreviews(plateName: (Int) -> String): List<PlatePreview> {
     val explicit = mapNotNull { it.plateIndex }.distinct().sorted()
     return explicit.map { plate ->
-        PlatePreview(plate, "盘 $plate", filter { it.plateIndex == plate })
+        PlatePreview(plate, plateName(plate), filter { it.plateIndex == plate })
     }.filter { it.meshes.isNotEmpty() }
 }
 
-private fun List<PlacedMeshData>.clusterPlatePreviews(): List<PlatePreview> {
+private fun List<PlacedMeshData>.clusterPlatePreviews(plateName: (Int) -> String): List<PlatePreview> {
     val clusters = clusterSparseXyGroups()
     if (clusters.size <= 1) return emptyList()
-    return clusters.mapIndexed { index, meshes -> PlatePreview(index + 1, "盘 ${index + 1}", meshes) }
+    return clusters.mapIndexed { index, meshes -> PlatePreview(index + 1, plateName(index + 1), meshes) }
 }
 
 

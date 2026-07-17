@@ -1,5 +1,6 @@
 package com.filament.preview
 
+import android.annotation.SuppressLint
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -57,6 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -94,7 +96,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private var isLoading by mutableStateOf(false)
-    private var status by mutableStateOf("选择一个 3MF 文件开始预览")
+    private var status by mutableStateOf("")
     private var meshes by mutableStateOf<List<SceneMesh>>(emptyList())
     private var loadedFileName by mutableStateOf("")
     private var loadedPlacedMeshes by mutableStateOf<List<PlacedMeshData>>(emptyList())
@@ -148,6 +150,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Utils.init()
+        if (status.isEmpty()) status = getString(R.string.status_initial)
         setContent {
             FilamentPreviewTheme {
                 PreviewScreen(
@@ -188,6 +191,7 @@ class MainActivity : ComponentActivity() {
         modelViewer = null
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun setupFilament(surfaceView: SurfaceView) {
         if (modelViewer != null) return
         filamentSurface = surfaceView
@@ -316,7 +320,7 @@ class MainActivity : ComponentActivity() {
 
     private fun load3mf(uri: Uri) {
         isLoading = true
-        status = "Loading..."
+        status = getString(R.string.status_loading)
         selectedIndex = null
         selectedIndices = emptySet()
         modelColorController.clearForNewModel()
@@ -407,7 +411,12 @@ class MainActivity : ComponentActivity() {
                             initialSceneMeshes = placedMeshes.toSceneMeshes(),
                         )
                     } else {
-                        Loaded3mf(source.name, placedMeshes, placedMeshes.detectPlatePreviews(), initialSceneMeshes = null)
+                        Loaded3mf(
+                            source.name,
+                            placedMeshes,
+                            placedMeshes.detectPlatePreviews { getString(R.string.plate_name, it) },
+                            initialSceneMeshes = null,
+                        )
                     }
                 }
                 loaded
@@ -434,7 +443,7 @@ class MainActivity : ComponentActivity() {
                 Log.d("onFailure", error.message ?: error.javaClass.simpleName)
                 runOnUiThread {
                     isLoading = false
-                    status = "加载失败"
+                    status = getString(R.string.status_load_failed)
                     Toast.makeText(
                         this,
                         error.message ?: error.javaClass.simpleName,
@@ -542,9 +551,9 @@ class MainActivity : ComponentActivity() {
         val fileName = loadedFileName.ifBlank { "selected.3mf" }
         val triangleCount = meshes.sumOf { it.indices.size / 3 }
         val modeText = if (previewMode == PreviewMode.Plate && plates.isNotEmpty()) {
-            plates.getOrNull(selectedPlateIndex)?.name ?: "按盘"
+            plates.getOrNull(selectedPlateIndex)?.name ?: getString(R.string.mode_by_plate)
         } else {
-            "全部"
+            getString(R.string.mode_all)
         }
         val topIds = meshes.mapNotNull { it.topLevelObjectId }.distinct()
         Log.d("ThreeMfDebug", "updateStatus: meshes=${meshes.size}, topLevelIds=$topIds, plates=${plates.size}")
@@ -740,16 +749,16 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         val EDITOR_COLORS = listOf(
-            EditorPaletteColor("白", RgbaColor(1.0f, 1.0f, 1.0f)),
-            EditorPaletteColor("灰", RgbaColor(0.45f, 0.48f, 0.52f)),
-            EditorPaletteColor("黑", RgbaColor(0.06f, 0.07f, 0.08f)),
-            EditorPaletteColor("红", RgbaColor(0.87f, 0.12f, 0.16f)),
-            EditorPaletteColor("橙", RgbaColor(0.95f, 0.34f, 0.12f)),
-            EditorPaletteColor("黄", RgbaColor(0.96f, 0.78f, 0.10f)),
-            EditorPaletteColor("绿", RgbaColor(0.10f, 0.68f, 0.34f)),
-            EditorPaletteColor("青", RgbaColor(0.04f, 0.66f, 0.72f)),
-            EditorPaletteColor("蓝", RgbaColor(0.10f, 0.42f, 0.95f)),
-            EditorPaletteColor("紫", RgbaColor(0.48f, 0.24f, 0.78f)),
+            EditorPaletteColor(R.string.color_white, RgbaColor(1.0f, 1.0f, 1.0f)),
+            EditorPaletteColor(R.string.color_gray, RgbaColor(0.45f, 0.48f, 0.52f)),
+            EditorPaletteColor(R.string.color_black, RgbaColor(0.06f, 0.07f, 0.08f)),
+            EditorPaletteColor(R.string.color_red, RgbaColor(0.87f, 0.12f, 0.16f)),
+            EditorPaletteColor(R.string.color_orange, RgbaColor(0.95f, 0.34f, 0.12f)),
+            EditorPaletteColor(R.string.color_yellow, RgbaColor(0.96f, 0.78f, 0.10f)),
+            EditorPaletteColor(R.string.color_green, RgbaColor(0.10f, 0.68f, 0.34f)),
+            EditorPaletteColor(R.string.color_cyan, RgbaColor(0.04f, 0.66f, 0.72f)),
+            EditorPaletteColor(R.string.color_blue, RgbaColor(0.10f, 0.42f, 0.95f)),
+            EditorPaletteColor(R.string.color_purple, RgbaColor(0.48f, 0.24f, 0.78f)),
         )
         private val IDENTITY_TRANSFORM = floatArrayOf(
             1.0f, 0.0f, 0.0f, 0.0f,
@@ -798,7 +807,7 @@ private fun Vec3.normalizedOr(fallback: Vec3): Vec3 {
 
 data class AxisLabel(val text: String, val x: Float, val y: Float, val color: Color)
 
-data class EditorPaletteColor(val name: String, val color: RgbaColor)
+data class EditorPaletteColor(val nameRes: Int, val color: RgbaColor)
 
 data class EditableColorState(
     val slot: MaterialSlot,
@@ -870,7 +879,7 @@ private fun PreviewScreen(
                             )
                         )
                     }) {
-                        Text("选择 3MF")
+                        Text(stringResource(R.string.btn_select_3mf))
                     }
                     Spacer(Modifier.width(12.dp))
                     Text(
@@ -885,7 +894,10 @@ private fun PreviewScreen(
                         enabled = editableColors.isNotEmpty(),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(if (editableColors.isEmpty()) "暂无可编辑颜色" else "编辑模型颜色 (${editableColors.size})")
+                        Text(
+                            if (editableColors.isEmpty()) stringResource(R.string.btn_no_editable_colors)
+                            else stringResource(R.string.btn_edit_model_colors, editableColors.size)
+                        )
                     }
                 }
                 if (plates.isNotEmpty()) {
@@ -893,7 +905,7 @@ private fun PreviewScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text("按盘")
+                        Text(stringResource(R.string.mode_by_plate))
                         Switch(
                             checked = previewMode == PreviewMode.Plate,
                             onCheckedChange = { checked ->
@@ -908,10 +920,10 @@ private fun PreviewScreen(
                             ) {
                                 val selectedPlate = plates.getOrNull(selectedPlateIndex)
                                 TextField(
-                                    value = selectedPlate?.let { "${it.name} (${it.meshes.mapNotNull { m -> m.topLevelObjectId }.distinct().size})" } ?: "选择盘",
+                                    value = selectedPlate?.let { "${it.name} (${it.meshes.mapNotNull { m -> m.topLevelObjectId }.distinct().size})" } ?: stringResource(R.string.dropdown_select_plate),
                                     onValueChange = {},
                                     readOnly = true,
-                                    label = { Text("当前盘") },
+                                    label = { Text(stringResource(R.string.dropdown_current_plate)) },
                                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(plateMenuExpanded) },
                                     modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, enabled = true),
                                 )
@@ -928,7 +940,7 @@ private fun PreviewScreen(
                                 }
                             }
                         } else {
-                            Text("全部盘一起预览", color = Color(0xFF475569))
+                            Text(stringResource(R.string.label_all_plates_preview), color = Color(0xFF475569))
                         }
                     }
                 }
@@ -936,16 +948,22 @@ private fun PreviewScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text("底板")
+                    Text(stringResource(R.string.label_base_plate))
                     Switch(checked = showBasePlate, onCheckedChange = onBasePlateChange)
                     selectedLengths?.let { lengths ->
                         Text(
-                            text = "选中: ${selectedName ?: "Object"}  X=${lengths.x.format()}  Y=${lengths.y.format()}  Z=${lengths.z.format()}",
+                            text = stringResource(
+                                R.string.label_selected_info,
+                                selectedName ?: "Object",
+                                lengths.x.format(),
+                                lengths.y.format(),
+                                lengths.z.format(),
+                            ),
                             color = Color(0xFF1D4ED8),
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     } ?: Text(
-                        "点击模型可显示/隐藏红(X)、绿(Y)、蓝(Z)包围线",
+                        stringResource(R.string.hint_tap_model),
                         color = Color(0xFF475569)
                     )
                 }
@@ -978,7 +996,7 @@ private fun PreviewScreen(
                 ) {
                     CircularProgressIndicator()
                     Spacer(Modifier.height(12.dp))
-                    Text("Loading 3MF...")
+                    Text(stringResource(R.string.loading_3mf))
                 }
             }
             if (colorDialogOpen) {
@@ -1007,7 +1025,7 @@ private fun ColorEditorDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("模型颜色") },
+        title = { Text(stringResource(R.string.dialog_model_colors)) },
         text = {
             Column(
                 modifier = Modifier
@@ -1017,9 +1035,9 @@ private fun ColorEditorDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("材质", modifier = Modifier.weight(1.2f), color = Color(0xFF64748B))
-                    Text("原有颜色", modifier = Modifier.weight(1f), color = Color(0xFF64748B))
-                    Text("改变后颜色", modifier = Modifier.weight(1f), color = Color(0xFF64748B))
+                    Text(stringResource(R.string.header_material), modifier = Modifier.weight(1.2f), color = Color(0xFF64748B))
+                    Text(stringResource(R.string.header_original_color), modifier = Modifier.weight(1f), color = Color(0xFF64748B))
+                    Text(stringResource(R.string.header_modified_color), modifier = Modifier.weight(1f), color = Color(0xFF64748B))
                 }
 
                 colors.forEachIndexed { index, state ->
@@ -1036,7 +1054,7 @@ private fun ColorEditorDialog(
                     ) {
                         Column(modifier = Modifier.weight(1.2f)) {
                             Text(
-                                state.slot.name?.takeIf { it.isNotBlank() } ?: "颜色 ${index + 1}",
+                                state.slot.name?.takeIf { it.isNotBlank() } ?: stringResource(R.string.color_slot_default, index + 1),
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                             Text(
@@ -1062,7 +1080,10 @@ private fun ColorEditorDialog(
                 selected?.let { state ->
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "修改：${state.slot.name?.takeIf { it.isNotBlank() } ?: "当前颜色"}",
+                        stringResource(
+                            R.string.label_modify,
+                            state.slot.name?.takeIf { it.isNotBlank() } ?: stringResource(R.string.label_current_color),
+                        ),
                         style = MaterialTheme.typography.titleSmall,
                     )
                     MainActivity.EDITOR_COLORS.chunked(5).forEach { rowColors ->
@@ -1080,17 +1101,17 @@ private fun ColorEditorDialog(
                         }
                     }
                     TextButton(onClick = { onColorReset(state.slot.id) }) {
-                        Text("恢复当前颜色")
+                        Text(stringResource(R.string.btn_reset_current_color))
                     }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("完成") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_done)) }
         },
         dismissButton = {
             TextButton(onClick = onAllColorsReset, enabled = colors.isNotEmpty()) {
-                Text("全部恢复")
+                Text(stringResource(R.string.btn_reset_all))
             }
         },
     )
@@ -1144,7 +1165,7 @@ private fun PaletteColorButton(
                     shape = RoundedCornerShape(10.dp),
                 ),
         )
-        Text(palette.name, style = MaterialTheme.typography.labelSmall)
+        Text(stringResource(palette.nameRes), style = MaterialTheme.typography.labelSmall)
     }
 }
 

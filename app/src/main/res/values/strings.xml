@@ -1,3 +1,39 @@
 <resources>
     <string name="app_name">3MF Filament Preview</string>
+    <string name="status_initial">Select a 3MF file to start preview</string>
+    <string name="status_loading">Loading…</string>
+    <string name="status_load_failed">Load failed</string>
+    <string name="mode_by_plate">By plate</string>
+    <string name="mode_all">All</string>
+    <string name="plate_name">Plate %1$d</string>
+    <string name="color_white">White</string>
+    <string name="color_gray">Gray</string>
+    <string name="color_black">Black</string>
+    <string name="color_red">Red</string>
+    <string name="color_orange">Orange</string>
+    <string name="color_yellow">Yellow</string>
+    <string name="color_green">Green</string>
+    <string name="color_cyan">Cyan</string>
+    <string name="color_blue">Blue</string>
+    <string name="color_purple">Purple</string>
+    <string name="btn_select_3mf">Select 3MF</string>
+    <string name="btn_no_editable_colors">No editable colors</string>
+    <string name="btn_edit_model_colors">Edit model colors (%1$d)</string>
+    <string name="dropdown_select_plate">Select plate</string>
+    <string name="dropdown_current_plate">Current plate</string>
+    <string name="label_all_plates_preview">Preview all plates together</string>
+    <string name="label_base_plate">Base plate</string>
+    <string name="label_selected_info">Selected: %1$s  X=%2$s  Y=%3$s  Z=%4$s</string>
+    <string name="hint_tap_model">Tap a model to show/hide red (X), green (Y), blue (Z) bounding lines</string>
+    <string name="loading_3mf">Loading 3MF…</string>
+    <string name="dialog_model_colors">Model colors</string>
+    <string name="header_material">Material</string>
+    <string name="header_original_color">Original color</string>
+    <string name="header_modified_color">Modified color</string>
+    <string name="color_slot_default">Color %1$d</string>
+    <string name="label_modify">Modify: %1$s</string>
+    <string name="label_current_color">Current color</string>
+    <string name="btn_reset_current_color">Reset current color</string>
+    <string name="btn_done">Done</string>
+    <string name="btn_reset_all">Reset all</string>
 </resources>
