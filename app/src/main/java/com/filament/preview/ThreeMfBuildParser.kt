@@ -6,16 +6,16 @@ import io.lib3mf.android.ComponentInfo
 import io.lib3mf.android.MeshData
 import org.json.JSONObject
 import org.w3c.dom.Element
+import org.xml.sax.Attributes
+import org.xml.sax.helpers.DefaultHandler
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.util.Locale
 import java.util.zip.ZipFile
 import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.parsers.SAXParserFactory
 import kotlin.math.max
-import java.util.Locale
 import kotlin.math.sqrt
-import org.xml.sax.Attributes
-import org.xml.sax.helpers.DefaultHandler
 
 /** A mesh resource after applying the transforms from the 3MF build graph. */
 data class PlacedMeshData(
@@ -123,7 +123,6 @@ fun List<PlacedMeshData>.detectPlatePreviews(): List<PlatePreview> {
     val selected = when {
         explicitPlates.size >= 2 && explicitPlates.size >= clusteredPlates.size -> explicitPlates
         clusteredPlates.size >= 2 -> clusteredPlates
-        explicitPlates.size >= 2 -> explicitPlates
         else -> emptyList()
     }
     Log.d(THREE_MF_LOG_TAG, "Plate detection: explicit=${explicitPlates.debugSummary()}, clustered=${clusteredPlates.debugSummary()}, selected=${selected.debugSummary()}")
@@ -339,6 +338,9 @@ private fun List<Bounds>.combinedBounds(): Bounds {
 }
 
 object ThreeMfBuildParser {
+    private var materialLayoutTotalMs: Long = 0
+    private val PAINT_COLOR_BYTES = "paint_color".toByteArray()
+
     fun hasExplicitMultiplePlates(file: File): Boolean {
         val jsonPlates = ZipFile(file).use { zip ->
             val plateFile = Regex("(?:^|/)plate[_-]?(\\d+)\\.json$", RegexOption.IGNORE_CASE)
@@ -350,7 +352,7 @@ object ThreeMfBuildParser {
         }
         if (jsonPlates >= 2) return true
 
-        val configPlates = readConfigPlateInstances(file)
+        val configPlates = ZipFile(file).use { readConfigPlateInstances(it) }
         if (configPlates.map { it.plateIndex }.distinct().take(2).count() >= 2) return true
 
         if (modelEntrySize(file) > MAX_MODEL_XML_PLATE_SCAN_BYTES) return false
@@ -370,84 +372,122 @@ object ThreeMfBuildParser {
         meshesByObjectId: Map<Int, MeshData>,
         namesByObjectId: Map<Int, String>,
     ): List<PlacedMeshData> {
-        val volumeConfigs = readVolumeConfigs(file)
-        val filamentPalette = readFilamentPalette(file)
-        val slicerMaterialsByObjectId = readSlicerMaterials(file, filamentPalette)
-        val scene = parseModel(file)
+        materialLayoutTotalMs = 0
         if (buildItems.isEmpty()) return emptyList()
-        val xmlBuildItems = scene?.buildItems.orEmpty()
-        val xmlObjectIds = xmlBuildItems.map { it.objectId }.toSet()
-        val jsonPlateByObjectId = readJsonPlateObjectIds(file, xmlObjectIds)
-        val configInstances = readConfigPlateInstances(file)
-        val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, configInstances)
 
-        logArchiveMetadata(file)
-        logModelHierarchy(buildItems, componentsByObjectId, meshesByObjectId, namesByObjectId)
-        Log.d(THREE_MF_LOG_TAG, "BuildItem count=${buildItems.size} (lib3mf), ${xmlBuildItems.size} (XML)")
-        buildItems.forEachIndexed { index, item ->
-            val xmlItem = xmlBuildItems.getOrNull(index)
-            Log.d(
-                THREE_MF_LOG_TAG,
-                "BuildItem[$index]: uniqueObjectId=${item.objectResourceId}, xmlObjectId=${xmlItem?.objectId}, " +
-                    "type=${item.objectResourceKind}, transform=${MeshTransform.fromLib3mf(item.transform).debugString()}, " +
-                    "xmlPlate=${xmlItem?.plateIndex}, configPlate=${configPlateByBuildIndex[index]}, " +
-                    "jsonPlate=${xmlItem?.objectId?.let(jsonPlateByObjectId::get)}",
-            )
-        }
-        scene?.objectsById?.values?.forEach { objectInfo ->
-            Log.d(
-                THREE_MF_LOG_TAG,
-                "XML object: localId=${objectInfo.id}, type=${objectInfo.type}, componentCount=${objectInfo.components.size}",
-            )
-            objectInfo.components.forEachIndexed { index, component ->
+        ZipFile(file).use { zip ->
+            // ==================== Phase 1: Parse Hierarchy ====================
+            val tPhase1 = System.currentTimeMillis()
+
+            val volumeConfigs = readVolumeConfigs(zip)
+            val scene = parseModelFromZip(zip)
+            val xmlBuildItems = scene?.buildItems.orEmpty()
+            val xmlObjectIds = xmlBuildItems.map { it.objectId }.toSet()
+            val jsonPlateByObjectId = readJsonPlateObjectIds(zip, xmlObjectIds)
+            val configInstances = readConfigPlateInstances(zip)
+            val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, configInstances)
+
+            val objectCount = scene?.objectsById?.size ?: 0
+            val componentCount = scene?.objectsById?.values?.sumOf { it.components.size } ?: 0
+            logArchiveMetadata(zip)
+            logModelHierarchy(buildItems, componentsByObjectId, meshesByObjectId, namesByObjectId)
+
+            val tHierarchy = System.currentTimeMillis() - tPhase1
+            Log.d("ThreeMfPerf", "parseHierarchy: $tHierarchy ms (objects=$objectCount, components=$componentCount)")
+
+            // ==================== Phase 2: Parse Materials ====================
+            val tPhase2 = System.currentTimeMillis()
+
+            val filamentPalette = readFilamentPalette(zip)
+            val slicerMaterialsByObjectId = readSlicerMaterials(zip, filamentPalette)
+
+            val slicerPartResourceIds = slicerMaterialsByObjectId.values
+                .flatMap { it.parts }
+                .mapNotNull { it.modelResourceId }
+                .toSet()
+            val meshResourceIds = meshesByObjectId.values.map { it.modelResourceId }.toSet()
+            val paintNeededIds = meshResourceIds.filter { mid ->
+                mid !in slicerPartResourceIds && meshesByObjectId.values.any {
+                    it.modelResourceId == mid && it.propertyData.triangleResourceIds.all { rid -> rid == 0 }
+                }
+            }.toSet()
+
+            val paintColorsByResource = readBambuPaintColors(zip, paintNeededIds)
+            paintColorsByResource.forEach { (resourceId, paintColors) ->
+                val digitCounts = paintColors.groupBy { it }.mapValues { it.value.size }
+                Log.d(THREE_MF_LOG_TAG, "Bambu paint_colors: resourceId=$resourceId, triangleCount=${paintColors.size}, digits=$digitCounts")
+            }
+
+            val tMaterial = System.currentTimeMillis() - tPhase2
+            Log.d("ThreeMfPerf", "parseMaterial: $tMaterial ms (paint_needed=${paintNeededIds.size}, paint_parsed=${paintColorsByResource.size})")
+
+            // ==================== Phase 3: Flatten & Apply ====================
+            val tPhase3 = System.currentTimeMillis()
+
+            Log.d(THREE_MF_LOG_TAG, "BuildItem count=${buildItems.size} (lib3mf), ${xmlBuildItems.size} (XML)")
+            buildItems.forEachIndexed { index, item ->
+                val xmlItem = xmlBuildItems.getOrNull(index)
                 Log.d(
                     THREE_MF_LOG_TAG,
-                    "  XML Component[$index]: parentLocalId=${objectInfo.id}, objectLocalId=${component.objectId}, " +
-                        "transform=${component.transform.debugString()}",
+                    "BuildItem[$index]: uniqueObjectId=${item.objectResourceId}, xmlObjectId=${xmlItem?.objectId}, " +
+                        "type=${item.objectResourceKind}, transform=${MeshTransform.fromLib3mf(item.transform).debugString()}, " +
+                        "xmlPlate=${xmlItem?.plateIndex}, configPlate=${configPlateByBuildIndex[index]}, " +
+                        "jsonPlate=${xmlItem?.objectId?.let(jsonPlateByObjectId::get)}",
                 )
             }
-        }
+            scene?.objectsById?.values?.forEach { objectInfo ->
+                Log.d(THREE_MF_LOG_TAG, "XML object: localId=${objectInfo.id}, type=${objectInfo.type}, componentCount=${objectInfo.components.size}")
+                objectInfo.components.forEachIndexed { index, component ->
+                    Log.d(THREE_MF_LOG_TAG, "  XML Component[$index]: parentLocalId=${objectInfo.id}, objectLocalId=${component.objectId}, transform=${component.transform.debugString()}")
+                }
+            }
 
-        val placed = buildItems.flatMapIndexed { index, item ->
-            val xmlItem = xmlBuildItems.getOrNull(index)
-            val plateIndex = xmlItem?.plateIndex
-                ?: configPlateByBuildIndex[index]
-                ?: xmlItem?.objectId?.let(jsonPlateByObjectId::get)
-            val slicerMaterial = xmlItem?.objectId?.let(slicerMaterialsByObjectId::get)
-            flattenObject(
-                objectId = item.objectResourceId,
-                objectKind = item.objectResourceKind,
-                topLevelObjectId = item.objectResourceId,
-                buildItemIndex = index,
-                plateIndex = plateIndex,
-                slicerMaterial = slicerMaterial,
-                transform = MeshTransform.fromLib3mf(item.transform),
-                objectPath = listOf(item.objectResourceId),
-                componentsByObjectId = componentsByObjectId,
-                meshesByObjectId = meshesByObjectId,
-                namesByObjectId = namesByObjectId,
-                volumeConfigsByObjectId = volumeConfigs,
-                activeStack = linkedSetOf(),
-            )
+            val placed = buildItems.flatMapIndexed { index, item ->
+                val xmlItem = xmlBuildItems.getOrNull(index)
+                val plateIndex = xmlItem?.plateIndex
+                    ?: configPlateByBuildIndex[index]
+                    ?: xmlItem?.objectId?.let(jsonPlateByObjectId::get)
+                val slicerMaterial = xmlItem?.objectId?.let(slicerMaterialsByObjectId::get)
+                flattenObject(
+                    objectId = item.objectResourceId,
+                    objectKind = item.objectResourceKind,
+                    topLevelObjectId = item.objectResourceId,
+                    buildItemIndex = index,
+                    plateIndex = plateIndex,
+                    slicerMaterial = slicerMaterial,
+                    transform = MeshTransform.fromLib3mf(item.transform),
+                    objectPath = listOf(item.objectResourceId),
+                    componentsByObjectId = componentsByObjectId,
+                    meshesByObjectId = meshesByObjectId,
+                    namesByObjectId = namesByObjectId,
+                    volumeConfigsByObjectId = volumeConfigs,
+                    activeStack = linkedSetOf(),
+                    paintColorsByResource = paintColorsByResource,
+                    filamentPalette = filamentPalette,
+                )
+            }
+
+            val named = placed.withUniqueNames()
+            named.groupBy { it.plateIndex }.toSortedMap(compareBy(nullsLast()) { it }).forEach { (plate, meshes) ->
+                Log.d(THREE_MF_LOG_TAG, "Parsed plate ${plate ?: "unassigned"} -> ${meshes.debugMapping()}")
+            }
+
+            val tFlatten = System.currentTimeMillis() - tPhase3
+            Log.d("ThreeMfPerf", "flattenApply: $tFlatten ms")
+            Log.d("ThreeMfPerf", "Split material: $materialLayoutTotalMs ms")
+            return named
         }
-        val named = placed.withUniqueNames()
-        named.groupBy { it.plateIndex }.toSortedMap(compareBy(nullsLast()) { it }).forEach { (plate, meshes) ->
-            Log.d(THREE_MF_LOG_TAG, "Parsed plate ${plate ?: "unassigned"} -> ${meshes.debugMapping()}")
-        }
-        return named
     }
 
-    private fun logArchiveMetadata(file: File) {
-        val entries = ZipFile(file).use { zip ->
-            zip.entries().asSequence()
-                .filter { !it.isDirectory }
-                .map { it.name }
-                .filter { name ->
-                    name.startsWith("Metadata/", ignoreCase = true) ||
-                        name.contains(Regex("plate[_-]?\\d+\\.json", RegexOption.IGNORE_CASE))
-                }
-                .toList()
-        }
+    private fun logArchiveMetadata(zip: ZipFile) {
+        val entries = zip.entries().asSequence()
+            .filter { !it.isDirectory }
+            .map { it.name }
+            .filter { name ->
+                name.startsWith("Metadata/", ignoreCase = true) ||
+                    name.contains(Regex("plate[_-]?\\d+\\.json", RegexOption.IGNORE_CASE))
+            }
+            .toList()
         Log.d(THREE_MF_LOG_TAG, "3MF metadata entries (${entries.size}): ${entries.joinToString()}")
     }
 
@@ -515,6 +555,8 @@ object ThreeMfBuildParser {
         namesByObjectId: Map<Int, String>,
         volumeConfigsByObjectId: Map<Int, List<SlicerVolumeConfig>>,
         activeStack: MutableSet<Int>,
+        paintColorsByResource: Map<Int, IntArray>,
+        filamentPalette: List<FloatArray>,
     ): List<PlacedMeshData> {
         if (!activeStack.add(objectId)) return emptyList()
 
@@ -522,17 +564,26 @@ object ThreeMfBuildParser {
         if (objectKind == "mesh") meshesByObjectId[objectId]?.let { mesh ->
             val objectName = namesByObjectId[objectId].orObjectName(objectId)
             val volumeMeshes = mesh.splitByVolumes(volumeConfigsByObjectId[objectId])
+            val paintColorDigits = paintColorsByResource[mesh.modelResourceId]
+                ?.takeIf { it.size == mesh.triangles.size / 3 }
             placed += volumeMeshes.map { volumeMesh ->
                 val partMaterial = slicerMaterial?.parts?.firstOrNull {
                     it.modelResourceId == volumeMesh.mesh.modelResourceId
                 }
                 val fallbackMaterial = partMaterial ?: slicerMaterial?.objectMaterial
+                val meshPaintDigits = if (volumeMeshes.size == 1 && volumeMesh.mesh === mesh) {
+                    paintColorDigits
+                } else {
+                    null
+                }
                 val layout = volumeMesh.mesh.buildMaterialLayout(
                     partMaterial = partMaterial,
                     objectMaterial = slicerMaterial?.objectMaterial,
                     volumeMaterials = slicerMaterial?.parts.orEmpty().filter {
                         it.firstTriangle != null && it.lastTriangle != null
                     },
+                    paintColorDigits = meshPaintDigits,
+                    filamentPalette = filamentPalette,
                 )
                 layout?.slots?.forEach { slot ->
                     val color = slot.originalColor
@@ -590,6 +641,8 @@ object ThreeMfBuildParser {
                 namesByObjectId = namesByObjectId,
                 volumeConfigsByObjectId = volumeConfigsByObjectId,
                 activeStack = activeStack,
+                paintColorsByResource = paintColorsByResource,
+                filamentPalette = filamentPalette,
             )
         }
 
@@ -601,6 +654,21 @@ object ThreeMfBuildParser {
         partMaterial: SlicerPartMaterial?,
         objectMaterial: SlicerPartMaterial?,
         volumeMaterials: List<SlicerPartMaterial>,
+        paintColorDigits: IntArray? = null,
+        filamentPalette: List<FloatArray> = emptyList(),
+    ): MeshMaterialLayout? {
+        val t0 = System.currentTimeMillis()
+        return buildMaterialLayoutInternal(partMaterial, objectMaterial, volumeMaterials, paintColorDigits, filamentPalette).also {
+            materialLayoutTotalMs += System.currentTimeMillis() - t0
+        }
+    }
+
+    private fun MeshData.buildMaterialLayoutInternal(
+        partMaterial: SlicerPartMaterial?,
+        objectMaterial: SlicerPartMaterial?,
+        volumeMaterials: List<SlicerPartMaterial>,
+        paintColorDigits: IntArray? = null,
+        filamentPalette: List<FloatArray> = emptyList(),
     ): MeshMaterialLayout? {
         val propertyByKey = propertyData.properties.associateBy { it.resourceId to it.propertyIndex }
         val slots = mutableListOf<MaterialSlot>()
@@ -638,12 +706,12 @@ object ThreeMfBuildParser {
                     id = MaterialSlotId(
                         source = MaterialSlotSource.SLICER_FILAMENT,
                         packagePath = packagePath,
-                        modelResourceId = modelResourceId,
-                        resourceId = objectId,
+                        modelResourceId = 0,
+                        resourceId = 0,
                         propertyIndex = material.extruderIndex - 1,
                         extruderIndex = material.extruderIndex,
                     ),
-                    name = material.name ?: "Extruder ${material.extruderIndex}",
+                    name = "Filament ${material.extruderIndex}",
                     originalColor = material.color,
                 ),
             )
@@ -663,6 +731,62 @@ object ThreeMfBuildParser {
                     originalColor = color,
                 ),
             )
+        }
+
+        if (paintColorDigits != null && paintColorDigits.isNotEmpty() && filamentPalette.isNotEmpty()) {
+            val paintTriangleCount = minOf(paintColorDigits.size, triangles.size / 3)
+            val digitFreq = IntArray(10)
+            for (ti in 0 until paintTriangleCount) {
+                val d = paintColorDigits[ti]
+                if (d in 0..9) digitFreq[d]++
+            }
+            val sortedDigits = (0..9).filter { digitFreq[it] > 0 }
+                .sortedByDescending { digitFreq[it] }
+            val digitToPalette = sortedDigits.mapIndexed { index, digit ->
+                digit to (index.coerceAtMost(filamentPalette.lastIndex))
+            }.toMap()
+            val digitToSlot = mutableMapOf<Int, Int>()
+            sortedDigits.forEach { digit ->
+                val paletteIndex = digitToPalette[digit] ?: return@forEach
+                val color = filamentPalette.getOrNull(paletteIndex)?.let(RgbaColor::fromFloatArray) ?: return@forEach
+                digitToSlot[digit] = addSlot(
+                    MaterialSlot(
+                        id = MaterialSlotId(
+                            source = MaterialSlotSource.BAMBU_PAINT,
+                            packagePath = packagePath,
+                            modelResourceId = 0,
+                            resourceId = 0,
+                            propertyIndex = paletteIndex,
+                        ),
+                        name = "Filament ${paletteIndex + 1}",
+                        originalColor = color,
+                    ),
+                )
+            }
+            val flatBySlot = linkedMapOf<Int, IntCollector>()
+            for (triangleIndex in 0 until paintTriangleCount) {
+                val digit = paintColorDigits[triangleIndex]
+                val slot = digitToSlot[digit] ?: continue
+                val collector = flatBySlot.getOrPut(slot) { IntCollector() }
+                val indexOffset = triangleIndex * 3
+                collector.add(triangles.getOrElse(indexOffset) { continue })
+                collector.add(triangles.getOrElse(indexOffset + 1) { continue })
+                collector.add(triangles.getOrElse(indexOffset + 2) { continue })
+                triangleCounts[slot] += 1
+            }
+            if (flatBySlot.isNotEmpty()) {
+                Log.d(
+                    THREE_MF_LOG_TAG,
+                    "Bambu paint colors: objectId=$objectId localId=$modelResourceId " +
+                        "triangles=$paintTriangleCount digits=$sortedDigits mapping=$digitToPalette",
+                )
+                return MeshMaterialLayout(
+                    slots = slots.mapIndexed { index, value -> value.copy(triangleCount = triangleCounts[index]) },
+                    primitives = flatBySlot.map { (slot, indices) ->
+                        MeshMaterialPrimitive(indices.toIntArray(), slot)
+                    },
+                )
+            }
         }
 
         val objectCoreSlot = propertyData.takeIf { it.hasObjectProperty }?.let {
@@ -796,23 +920,100 @@ object ThreeMfBuildParser {
         }.ifEmpty { listOf(VolumeMeshData(this, null)) }
     }
 
-    private fun readVolumeConfigs(file: File): Map<Int, List<SlicerVolumeConfig>> = ZipFile(file).use { zip ->
+    private fun readBambuPaintColors(
+        zip: ZipFile,
+        neededIds: Set<Int>,
+    ): Map<Int, IntArray> {
+        if (neededIds.isEmpty()) return emptyMap()
+        val result = mutableMapOf<Int, IntArray>()
+        val remaining = neededIds.toMutableSet()
+
         zip.entries().asSequence()
-            .filter { !it.isDirectory && it.name.endsWith(".config", ignoreCase = true) }
-            .map { entry -> zip.getInputStream(entry).use { it.readBytes() } }
-            .mapNotNull(::parseSlicerConfig)
-            .firstOrNull { it.isNotEmpty() }
-            .orEmpty()
+            .filter { !it.isDirectory && it.name.startsWith("3D/Objects/") && it.name.endsWith(".model") }
+            .takeWhile { remaining.isNotEmpty() }
+            .forEach { entry ->
+                val (objectId, colors) = zip.getInputStream(entry).use { input ->
+                    parsePaintColorsWithId(input)
+                } ?: return@forEach
+                if (objectId !in remaining) return@forEach
+                if (colors.isNotEmpty()) {
+                    result[objectId] = colors
+                    remaining.remove(objectId)
+                }
+            }
+
+        return result
     }
 
-    private fun readFilamentPalette(file: File): List<FloatArray> = ZipFile(file).use { zip ->
+    private fun parsePaintColorsWithId(input: java.io.InputStream): Pair<Int, IntArray>? {
+        val bytes = input.readBytes()
+        if (!bytes.containsBytes(PAINT_COLOR_BYTES)) return null
+
+        var objectId = -1
+        val paintColors = mutableListOf<Int>()
+        val handler = object : DefaultHandler() {
+            var inMesh = false
+            override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes) {
+                val name = elementName(localName, qName)
+                if (name == "object") {
+                    val id = attributes.intValue("id")
+                    if (id != null) objectId = id
+                } else if (name == "mesh") {
+                    inMesh = true
+                } else if (inMesh && name == "triangle") {
+                    val pc = attributes.stringValue("paint_color")
+                    if (pc.isNotEmpty()) {
+                        val digit = pc[0].digitToIntOrNull()
+                        if (digit != null) paintColors.add(digit)
+                    }
+                }
+            }
+            override fun endElement(uri: String?, localName: String?, qName: String?) {
+                if (elementName(localName, qName) == "mesh") inMesh = false
+            }
+        }
+        return runCatching {
+            saxParser.parse(ByteArrayInputStream(bytes), handler)
+            if (objectId < 0 || paintColors.isEmpty()) null
+            else objectId to paintColors.toIntArray()
+        }.getOrNull()
+    }
+
+    private fun ByteArray.containsBytes(target: ByteArray): Boolean {
+        val max = size - target.size
+        if (max < 0) return false
+        val first = target[0]
+        var i = 0
+        while (i <= max) {
+            if (this[i] == first) {
+                var match = true
+                for (j in 1 until target.size) {
+                    if (this[i + j] != target[j]) { match = false; break }
+                }
+                if (match) return true
+            }
+            i++
+        }
+        return false
+    }
+
+    private fun readVolumeConfigs(zip: ZipFile): Map<Int, List<SlicerVolumeConfig>> = zip.entries().asSequence()
+        .filter { !it.isDirectory && it.name.endsWith(".config", ignoreCase = true) }
+        .mapNotNull { entry ->
+            val xml = zip.getInputStream(entry).use { it.readBytes() }
+            parseSlicerConfig(xml)?.takeIf { it.isNotEmpty() }
+        }
+        .firstOrNull()
+        .orEmpty()
+
+    private fun readFilamentPalette(zip: ZipFile): List<FloatArray> {
         val entry = zip.getEntry(PROJECT_CONFIG_PATH)
             ?: zip.entries().asSequence().firstOrNull {
                 !it.isDirectory && it.name.endsWith("project_settings.config", ignoreCase = true)
             }
             ?: return emptyList()
         val json = zip.getInputStream(entry).use { it.readBytes().toString(Charsets.UTF_8) }
-        runCatching {
+        return runCatching {
             val settings = JSONObject(json)
             val colors = settings.optJSONArray("filament_colour")
                 ?: settings.optJSONArray("filament_color")
@@ -825,17 +1026,16 @@ object ThreeMfBuildParser {
         }.getOrDefault(emptyList())
     }
 
-    private fun readSlicerMaterials(file: File, palette: List<FloatArray>): Map<Int, SlicerObjectMaterial> {
+    private fun readSlicerMaterials(zip: ZipFile, palette: List<FloatArray>): Map<Int, SlicerObjectMaterial> {
         if (palette.isEmpty()) return emptyMap()
-        return ZipFile(file).use { zip ->
-            val entry = zip.getEntry(CONFIG_PATH)
-                ?: zip.entries().asSequence().firstOrNull {
-                    !it.isDirectory && it.name.endsWith("model_settings.config", ignoreCase = true)
-                }
-                ?: return emptyMap()
-            val xml = zip.getInputStream(entry).use { it.readBytes() }
-            runCatching {
-                val document = newDocumentBuilder().parse(ByteArrayInputStream(xml))
+        val entry = zip.getEntry(CONFIG_PATH)
+            ?: zip.entries().asSequence().firstOrNull {
+                !it.isDirectory && it.name.endsWith("model_settings.config", ignoreCase = true)
+            }
+            ?: return emptyMap()
+        val xml = zip.getInputStream(entry).use { it.readBytes() }
+        return runCatching {
+                val document = documentBuilder.parse(ByteArrayInputStream(xml))
                 document.documentElement.descendantElements("object")
                     .mapNotNull { element ->
                         val objectId = element.intAttribute("id") ?: return@mapNotNull null
@@ -858,7 +1058,6 @@ object ThreeMfBuildParser {
                     }
                     .toMap()
             }.getOrDefault(emptyMap())
-        }
     }
 
     private fun Element.slicerMaterial(
@@ -905,8 +1104,8 @@ object ThreeMfBuildParser {
         (alpha * 255.0f + 0.5f).toInt().coerceIn(0, 255),
     )
 
-    private fun readJsonPlateObjectIds(file: File, candidateObjectIds: Set<Int>): Map<Int, Int> = ZipFile(file).use { zip ->
-        if (candidateObjectIds.isEmpty()) return@use emptyMap()
+    private fun readJsonPlateObjectIds(zip: ZipFile, candidateObjectIds: Set<Int>): Map<Int, Int> {
+        if (candidateObjectIds.isEmpty()) return emptyMap()
         val plateByObjectId = linkedMapOf<Int, Int>()
         val plateFile = Regex("(?:^|/)plate[_-]?(\\d+)\\.json$", RegexOption.IGNORE_CASE)
 
@@ -919,7 +1118,7 @@ object ThreeMfBuildParser {
                     if (json.referencesObjectId(objectId)) plateByObjectId.putIfAbsent(objectId, plate)
                 }
             }
-        plateByObjectId
+        return plateByObjectId
     }
 
     private fun String.referencesObjectId(objectId: Int): Boolean {
@@ -929,7 +1128,7 @@ object ThreeMfBuildParser {
     }
 
     private fun parseSlicerConfig(configXml: ByteArray): Map<Int, List<SlicerVolumeConfig>>? = runCatching {
-        val document = newDocumentBuilder().parse(ByteArrayInputStream(configXml))
+        val document = documentBuilder.parse(ByteArrayInputStream(configXml))
         document.documentElement.descendantElements("object")
             .mapNotNull { objectElement ->
                 val objectId = objectElement.intAttribute("id") ?: return@mapNotNull null
@@ -950,10 +1149,14 @@ object ThreeMfBuildParser {
     }.getOrNull()
 
     private fun parseModel(file: File): ThreeMfScene? = ZipFile(file).use { zip ->
+        parseModelFromZip(zip)
+    }
+
+    private fun parseModelFromZip(zip: ZipFile): ThreeMfScene? {
         val entry = zip.getEntry(STANDARD_MODEL_PATH)
             ?: zip.entries().asSequence().firstOrNull { !it.isDirectory && it.name.endsWith(".model", ignoreCase = true) }
             ?: return null
-        zip.getInputStream(entry).use { input ->
+        return zip.getInputStream(entry).use { input ->
             runCatching { parseModelStream(input) }.getOrNull()
         }
     }
@@ -969,6 +1172,7 @@ object ThreeMfBuildParser {
         var currentObjectId: Int? = null
         var currentObjectHasMesh = false
         var currentComponents = mutableListOf<ThreeMfComponent>()
+        var currentObjectPath: String? = null
         var currentBuildItem: PendingBuildItem? = null
         var currentPlateMetadata: StringBuilder? = null
 
@@ -980,6 +1184,9 @@ object ThreeMfBuildParser {
                     "build" -> inBuild = true
                     "object" -> if (inResources && currentObjectId == null) {
                         currentObjectId = attributes.intValue("id")
+                        currentObjectPath = attributes.stringValue("p:path")
+                            .ifBlank { attributes.stringValue("path") }
+                            .ifBlank { null }
                         currentObjectHasMesh = false
                         currentComponents = mutableListOf()
                     }
@@ -1017,7 +1224,7 @@ object ThreeMfBuildParser {
             }
 
             override fun characters(ch: CharArray, start: Int, length: Int) {
-                currentPlateMetadata?.append(ch, start, length)
+                currentPlateMetadata?.appendRange(ch, start, start + length)
             }
 
             override fun endElement(uri: String?, localName: String?, qName: String?) {
@@ -1037,9 +1244,10 @@ object ThreeMfBuildParser {
                     }
                     "components" -> inComponents = false
                     "object" -> currentObjectId?.let { id ->
-                        objects[id] = ThreeMfObject(id, currentObjectHasMesh, currentComponents)
+                        objects[id] = ThreeMfObject(id, currentObjectHasMesh, currentComponents, currentObjectPath)
                         currentObjectId = null
                         currentObjectHasMesh = false
+                        currentObjectPath = null
                         currentComponents = mutableListOf()
                     }
                     "build" -> inBuild = false
@@ -1048,7 +1256,7 @@ object ThreeMfBuildParser {
             }
         }
 
-        newSaxParser().parse(input, handler)
+        saxParser.parse(input, handler)
         return ThreeMfScene(objects, buildItems)
     }
 
@@ -1100,37 +1308,22 @@ object ThreeMfBuildParser {
         ?.getAttribute("value")
         ?.takeIf { it.isNotBlank() }
 
-    private fun newSaxParser() = SAXParserFactory.newInstance().apply {
+    private val saxParser by lazy { SAXParserFactory.newInstance().apply {
         isNamespaceAware = true
         runCatching { setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
         runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
         runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
         runCatching { setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
-    }.newSAXParser()
+    }.newSAXParser() }
 
-    private fun newDocumentBuilder() = DocumentBuilderFactory.newInstance().apply {
+    private val documentBuilder by lazy { DocumentBuilderFactory.newInstance().apply {
         isNamespaceAware = true
         runCatching { setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
         runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
         runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
         runCatching { setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
         isExpandEntityReferences = false
-    }.newDocumentBuilder()
-
-    private fun Element.plateIndex(): Int? {
-        val attributeNames = listOf("plate", "plate_id", "plateid", "plate_index", "plateindex")
-        attributeNames.firstNotNullOfOrNull { name -> getAttribute(name).toIntOrNull() }?.let { return it }
-        val metadataNames = setOf("plate", "plate_id", "plateid", "plate_index", "plateindex", "plater_id", "platerid")
-        return childElements("metadata")
-            .firstNotNullOfOrNull { metadata ->
-                val key = metadata.getAttribute("key").ifBlank { metadata.getAttribute("name") }.lowercase(Locale.US)
-                if (key in metadataNames) {
-                    metadata.getAttribute("value").ifBlank { metadata.textContent }.trim().toIntOrNull()
-                } else {
-                    null
-                }
-            }
-    }
+    }.newDocumentBuilder() }
 
     private fun Attributes.plateIndex(): Int? {
         val attributeNames = listOf("plate", "plate_id", "plateid", "plate_index", "plateindex")
@@ -1159,13 +1352,13 @@ object ThreeMfBuildParser {
     private fun String?.orObjectName(objectId: Int): String =
         this?.takeIf { it.isNotBlank() } ?: "Object $objectId"
 
-    private fun readConfigPlateInstances(file: File): List<PlateInstanceAssignment> = ZipFile(file).use { zip ->
+    private fun readConfigPlateInstances(zip: ZipFile): List<PlateInstanceAssignment> {
         val entry = zip.getEntry(CONFIG_PATH)
             ?: zip.entries().asSequence().firstOrNull {
                 !it.isDirectory && it.name.endsWith("model_settings.config", ignoreCase = true)
             }
             ?: return emptyList()
-        zip.getInputStream(entry).use { input ->
+        return zip.getInputStream(entry).use { input ->
             runCatching { parseConfigPlateInstances(input) }.getOrDefault(emptyList())
         }
     }
@@ -1221,7 +1414,7 @@ object ThreeMfBuildParser {
             }
         }
 
-        newSaxParser().parse(input, handler)
+        saxParser.parse(input, handler)
         return assignments
     }
 
@@ -1302,6 +1495,7 @@ private data class ThreeMfObject(
     val id: Int,
     val hasMesh: Boolean,
     val components: List<ThreeMfComponent>,
+    val path: String? = null,
 ) {
     val type: String
         get() = when {

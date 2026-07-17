@@ -3,6 +3,7 @@ package com.filament.preview
 enum class MaterialSlotSource {
     CORE_3MF,
     SLICER_FILAMENT,
+    BAMBU_PAINT,
     DEFAULT,
 }
 

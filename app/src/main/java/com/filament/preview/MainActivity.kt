@@ -102,6 +102,7 @@ class MainActivity : ComponentActivity() {
     private var previewMode by mutableStateOf(PreviewMode.All)
     private var selectedPlateIndex by mutableIntStateOf(0)
     private var selectedIndex by mutableStateOf<Int?>(null)
+    private var selectedIndices by mutableStateOf(emptySet<Int>())
     private var showBasePlate by mutableStateOf(true)
     private var editableColors by mutableStateOf<List<EditableColorState>>(emptyList())
     private var basePlateEntities = IntArray(0)
@@ -317,13 +318,16 @@ class MainActivity : ComponentActivity() {
         isLoading = true
         status = "Loading..."
         selectedIndex = null
+        selectedIndices = emptySet()
         modelColorController.clearForNewModel()
         editableColors = emptyList()
         thread(name = "3mf-loader") {
             runCatching {
                 val source = copyToCache(uri)
                 val usePlateLogic = ThreeMfBuildParser.hasExplicitMultiplePlates(source)
+                val perfStart = System.currentTimeMillis()
                 val loaded = open3mf(source.absolutePath).use { document ->
+                    Log.d("ThreeMfPerf", "Load 3MF: ${System.currentTimeMillis() - perfStart} ms")
                     Log.d("ThreeMfDebug", "lib3mf version=${document.getLibraryVersion()}")
                     val objects = document.getObjects()
                     Log.d("ThreeMfDebug", "lib3mf GetObjects count=${objects.size}")
@@ -343,6 +347,7 @@ class MainActivity : ComponentActivity() {
                     val meshObjects = objects.filter {
                         it.resourceKind == "mesh" && it.vertexCount > 0 && it.triangleCount > 0
                     }
+                    val tMeshStart = System.currentTimeMillis()
                     val rawMeshes = meshObjects.map { info ->
                         val mesh = document.getMeshData(info.resourceId)
                         val properties = mesh.propertyData
@@ -376,6 +381,7 @@ class MainActivity : ComponentActivity() {
                         )
                         info to mesh
                     }
+                    Log.d("ThreeMfPerf", "parseMesh: ${System.currentTimeMillis() - tMeshStart} ms")
                     val namesByObjectId = objects.associate { info -> info.resourceId to info.name }
                     val meshesByObjectId = rawMeshes.associate { (info, mesh) -> info.resourceId to mesh }
                     val placedMeshes = ThreeMfBuildParser.placedMeshes(
@@ -415,6 +421,7 @@ class MainActivity : ComponentActivity() {
                     if (loaded.initialSceneMeshes != null) {
                         meshes = loaded.initialSceneMeshes
                         selectedIndex = null
+                        selectedIndices = emptySet()
                         resetOrbitCamera()
                         reloadModel()
                         updateStatus()
@@ -457,8 +464,22 @@ class MainActivity : ComponentActivity() {
         if (meshes.isEmpty()) return
         val pickY = surface.height - y
         viewer.view.pick(x, pickY, pickHandler) { result ->
-            val hit = entityToMeshIndex[result.renderable]
-            selectedIndex = if (hit != null && hit == selectedIndex) null else hit
+            val hit = entityToMeshIndex[result.renderable] ?: return@pick
+            val hitMesh = meshes.getOrNull(hit) ?: return@pick
+            val groupId = hitMesh.topLevelObjectId
+            if (groupId != null) {
+                val group = meshes.indices.filter { meshes[it].topLevelObjectId == groupId }.toSet()
+                if (hit in selectedIndices) {
+                    selectedIndex = null
+                    selectedIndices = emptySet()
+                } else {
+                    selectedIndex = hit
+                    selectedIndices = group
+                }
+            } else {
+                selectedIndex = if (hit == selectedIndex) null else hit
+                selectedIndices = selectedIndex?.let { setOf(it) } ?: emptySet()
+            }
             applyMarkerVisibility()
             updateAxisLabels()
         }
@@ -488,10 +509,13 @@ class MainActivity : ComponentActivity() {
     private fun List<PlacedMeshData>.toSceneMeshes(): List<SceneMesh> {
         if (isEmpty()) return emptyList()
         val (center, scale) = placedNormalization()
+        val topLevelCounts = groupingBy { it.topLevelObjectId }.eachCount()
+        Log.d("ThreeMfDebug", "toSceneMeshes: placed=${size}, topLevelCounts=$topLevelCounts")
         return flatMap { placed ->
             Log.d(
                 "ThreeMfDebug",
                 "Filament mesh: objectId=${placed.mesh.objectId} " +
+                    "topLevelObjectId=${placed.topLevelObjectId} " +
                     "componentPath=${placed.objectPath.joinToString(" -> ")} " +
                     "world3mf=${placed.transform.debugString()} " +
                     "finalFilament=${placed.transform.toFilamentMatrix(center, scale, placed.previewOffset).debugMatrix()} " +
@@ -522,12 +546,15 @@ class MainActivity : ComponentActivity() {
         } else {
             "全部"
         }
+        val topIds = meshes.mapNotNull { it.topLevelObjectId }.distinct()
+        Log.d("ThreeMfDebug", "updateStatus: meshes=${meshes.size}, topLevelIds=$topIds, plates=${plates.size}")
+        val modelCount = topIds.count().takeIf { it > 0 } ?: meshes.size
         status = String.format(
             Locale.US,
             "%s: %s, %d model(s), %d triangles",
             fileName,
             modeText,
-            meshes.size,
+            modelCount,
             triangleCount,
         )
     }
@@ -544,12 +571,16 @@ class MainActivity : ComponentActivity() {
         viewer.destroyModel()
         modelColorController.replaceAvailableSlots(currentMeshes)
         refreshEditableColors()
+        val tFilamentStart = System.currentTimeMillis()
         val glb = GlbSceneBuilder.build(
             currentMeshes,
             null,
             modelColorController.overrideSnapshot(),
         )
+        val tGlbDone = System.currentTimeMillis()
         viewer.loadModelGlb(glb)
+        val tLoadDone = System.currentTimeMillis()
+        Log.d("ThreeMfPerf", "createFilament: ${tLoadDone - tFilamentStart} ms (GLB=${tGlbDone - tFilamentStart} ms, load=${tLoadDone - tGlbDone} ms)")
         updateOrbitCamera()
         cacheSceneEntities()
         applySceneVisibility()
@@ -877,7 +908,7 @@ private fun PreviewScreen(
                             ) {
                                 val selectedPlate = plates.getOrNull(selectedPlateIndex)
                                 TextField(
-                                    value = selectedPlate?.let { "${it.name} (${it.meshes.size})" } ?: "选择盘",
+                                    value = selectedPlate?.let { "${it.name} (${it.meshes.mapNotNull { m -> m.topLevelObjectId }.distinct().size})" } ?: "选择盘",
                                     onValueChange = {},
                                     readOnly = true,
                                     label = { Text("当前盘") },
@@ -890,7 +921,7 @@ private fun PreviewScreen(
                                 ) {
                                     plates.forEachIndexed { index, plate ->
                                         DropdownMenuItem(
-                                            text = { Text("${plate.name} (${plate.meshes.size})") },
+                                            text = { Text("${plate.name} (${plate.meshes.mapNotNull { m -> m.topLevelObjectId }.distinct().size})") },
                                             onClick = { onPlateChange(index); plateMenuExpanded = false },
                                         )
                                     }
