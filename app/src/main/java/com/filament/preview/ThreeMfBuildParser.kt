@@ -29,7 +29,41 @@ data class PlacedMeshData(
     val objectPath: List<Int> = listOf(mesh.objectId),
     val transform: MeshTransform = MeshTransform.IDENTITY,
     val previewOffset: Vec3 = Vec3(0.0f, 0.0f, 0.0f),
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as PlacedMeshData
+
+        if (topLevelObjectId != other.topLevelObjectId) return false
+        if (buildItemIndex != other.buildItemIndex) return false
+        if (plateIndex != other.plateIndex) return false
+        if (mesh != other.mesh) return false
+        if (name != other.name) return false
+        if (!displayColor.contentEquals(other.displayColor)) return false
+        if (materialLayout != other.materialLayout) return false
+        if (objectPath != other.objectPath) return false
+        if (transform != other.transform) return false
+        if (previewOffset != other.previewOffset) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = topLevelObjectId ?: 0
+        result = 31 * result + (buildItemIndex ?: 0)
+        result = 31 * result + (plateIndex ?: 0)
+        result = 31 * result + mesh.hashCode()
+        result = 31 * result + name.hashCode()
+        result = 31 * result + (displayColor?.contentHashCode() ?: 0)
+        result = 31 * result + (materialLayout?.hashCode() ?: 0)
+        result = 31 * result + objectPath.hashCode()
+        result = 31 * result + transform.hashCode()
+        result = 31 * result + previewOffset.hashCode()
+        return result
+    }
+}
 
 data class PlatePreview(val index: Int, val name: String, val meshes: List<PlacedMeshData>)
 

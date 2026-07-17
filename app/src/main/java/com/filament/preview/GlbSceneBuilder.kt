@@ -363,6 +363,36 @@ object GlbSceneBuilder {
                 bin.putUInts(indices)
             }
         }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+
+            other as Primitive
+
+            if (materialIndex != other.materialIndex) return false
+            if (mode != other.mode) return false
+            if (indexComponentType != other.indexComponentType) return false
+            if (indexByteLength != other.indexByteLength) return false
+            if (!vertices.contentEquals(other.vertices)) return false
+            if (!indices.contentEquals(other.indices)) return false
+            if (!colors.contentEquals(other.colors)) return false
+            if (!normals.contentEquals(other.normals)) return false
+
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = materialIndex
+            result = 31 * result + mode
+            result = 31 * result + indexComponentType
+            result = 31 * result + indexByteLength
+            result = 31 * result + vertices.contentHashCode()
+            result = 31 * result + indices.contentHashCode()
+            result = 31 * result + (colors?.contentHashCode() ?: 0)
+            result = 31 * result + normals.contentHashCode()
+            return result
+        }
     }
     private data class BufferView(val offset: Int, val length: Int, val target: Int)
     private data class Accessor(val bufferView: Int, val componentType: Int, val count: Int, val type: String, val bounds: Bounds?)

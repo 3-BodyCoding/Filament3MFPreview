@@ -48,7 +48,27 @@ data class MeshMaterialPrimitive(
     val indices: IntArray,
     val materialSlotIndex: Int,
     val cornerMaterialSlotIndices: IntArray? = null,
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as MeshMaterialPrimitive
+
+        if (materialSlotIndex != other.materialSlotIndex) return false
+        if (!indices.contentEquals(other.indices)) return false
+        if (!cornerMaterialSlotIndices.contentEquals(other.cornerMaterialSlotIndices)) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = materialSlotIndex
+        result = 31 * result + indices.contentHashCode()
+        result = 31 * result + (cornerMaterialSlotIndices?.contentHashCode() ?: 0)
+        return result
+    }
+}
 
 data class MeshMaterialLayout(
     val slots: List<MaterialSlot>,

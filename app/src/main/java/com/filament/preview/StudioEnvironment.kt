@@ -182,7 +182,26 @@ class StudioEnvironment private constructor(
     }
 }
 
-private data class StudioRadiance(val pixels: ByteBuffer, val irradianceSh: FloatArray)
+private data class StudioRadiance(val pixels: ByteBuffer, val irradianceSh: FloatArray) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as StudioRadiance
+
+        if (pixels != other.pixels) return false
+        if (!irradianceSh.contentEquals(other.irradianceSh)) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = pixels.hashCode()
+        result = 31 * result + irradianceSh.contentHashCode()
+        return result
+    }
+}
+
 private data class HdrColor(val red: Float, val green: Float, val blue: Float)
 
 internal fun fullMipLevelCount(width: Int, height: Int): Int {

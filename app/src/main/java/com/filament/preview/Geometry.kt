@@ -38,6 +38,37 @@ data class SceneMesh(
 ) {
     /** 获取该模型在 3MF 原始坐标中的 X/Y/Z 长度。 */
     fun xyzLengths(): XyzLengths = originalBounds.xyzLengths()
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as SceneMesh
+
+        if (objectId != other.objectId) return false
+        if (topLevelObjectId != other.topLevelObjectId) return false
+        if (name != other.name) return false
+        if (!vertices.contentEquals(other.vertices)) return false
+        if (!indices.contentEquals(other.indices)) return false
+        if (originalBounds != other.originalBounds) return false
+        if (renderBounds != other.renderBounds) return false
+        if (!displayColor.contentEquals(other.displayColor)) return false
+        if (materialLayout != other.materialLayout) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = objectId
+        result = 31 * result + (topLevelObjectId ?: 0)
+        result = 31 * result + name.hashCode()
+        result = 31 * result + vertices.contentHashCode()
+        result = 31 * result + indices.contentHashCode()
+        result = 31 * result + originalBounds.hashCode()
+        result = 31 * result + renderBounds.hashCode()
+        result = 31 * result + (displayColor?.contentHashCode() ?: 0)
+        result = 31 * result + (materialLayout?.hashCode() ?: 0)
+        return result
+    }
 }
 
 fun List<SceneMesh>.selectedXyzLengths(selectedIndex: Int?): XyzLengths? =
@@ -193,7 +224,25 @@ private fun splitConnectedComponents(vertices: FloatArray, triangles: IntArray):
     }
 }
 
-private data class MeshComponent(val vertices: FloatArray, val triangles: IntArray)
+private data class MeshComponent(val vertices: FloatArray, val triangles: IntArray) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as MeshComponent
+
+        if (!vertices.contentEquals(other.vertices)) return false
+        if (!triangles.contentEquals(other.triangles)) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = vertices.contentHashCode()
+        result = 31 * result + triangles.contentHashCode()
+        return result
+    }
+}
 
 fun FloatArray.computeBounds(): Bounds {
     var minX = Float.POSITIVE_INFINITY
