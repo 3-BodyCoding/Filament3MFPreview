@@ -328,7 +328,8 @@ class MainActivity : ComponentActivity() {
         thread(name = "3mf-loader") {
             runCatching {
                 val source = copyToCache(uri)
-                val usePlateLogic = ThreeMfBuildParser.hasExplicitMultiplePlates(source)
+                val explicitPlateIndices = ThreeMfBuildParser.explicitPlateIndices(source)
+                val usePlateLogic = explicitPlateIndices.size >= 2
                 val perfStart = System.currentTimeMillis()
                 val loaded = open3mf(source.absolutePath).use { document ->
                     Log.d("ThreeMfPerf", "Load 3MF: ${System.currentTimeMillis() - perfStart} ms")
@@ -414,7 +415,7 @@ class MainActivity : ComponentActivity() {
                         Loaded3mf(
                             source.name,
                             placedMeshes,
-                            placedMeshes.detectPlatePreviews { getString(R.string.plate_name, it) },
+                            placedMeshes.detectPlatePreviews(explicitPlateIndices) { getString(R.string.plate_name, it) },
                             initialSceneMeshes = null,
                         )
                     }

@@ -148,22 +148,31 @@ class MeshTransform private constructor(private val values: FloatArray) {
     }
 }
 
-fun List<PlacedMeshData>.detectPlatePreviews(plateName: (Int) -> String = { "Plate $it" }): List<PlatePreview> {
-    if (isEmpty()) return emptyList()
+fun List<PlacedMeshData>.detectPlatePreviews(
+    declaredPlateIndices: List<Int> = emptyList(),
+    plateName: (Int) -> String = { "Plate $it" },
+): List<PlatePreview> {
+    val selected = resolvePlatePreviews(declaredPlateIndices, plateName)
+    if (isEmpty()) return selected
 
-    val explicitPlates = explicitPlatePreviews(plateName)
-    val clusteredPlates = clusterPlatePreviews(plateName)
-
-    val selected = when {
-        explicitPlates.size >= 2 && explicitPlates.size >= clusteredPlates.size -> explicitPlates
-        clusteredPlates.size >= 2 -> clusteredPlates
-        else -> emptyList()
-    }
-    Log.d(THREE_MF_LOG_TAG, "Plate detection: explicit=${explicitPlates.debugSummary()}, clustered=${clusteredPlates.debugSummary()}, selected=${selected.debugSummary()}")
+    Log.d(THREE_MF_LOG_TAG, "Plate detection: selected=${selected.debugSummary()}")
     selected.forEach { plate ->
         Log.d(THREE_MF_LOG_TAG, "Final plate ${plate.index} -> ${plate.meshes.debugMapping()}")
     }
     return selected
+}
+
+internal fun List<PlacedMeshData>.resolvePlatePreviews(
+    declaredPlateIndices: List<Int> = emptyList(),
+    plateName: (Int) -> String = { "Plate $it" },
+): List<PlatePreview> {
+    if (isEmpty()) return declaredPlateIndices.distinct().sorted().map { PlatePreview(it, plateName(it), emptyList()) }
+
+    val explicitPlates = explicitPlatePreviews(declaredPlateIndices, plateName)
+    if (explicitPlates.size >= 2) return explicitPlates
+
+    val clusteredPlates = clusterPlatePreviews(plateName)
+    return clusteredPlates.takeIf { it.size >= 2 }.orEmpty()
 }
 
 private fun List<PlatePreview>.debugSummary(): String =
@@ -176,7 +185,7 @@ private fun List<PlacedMeshData>.debugMapping(): String = joinToString(prefix = 
 fun List<PlacedMeshData>.arrangedForAllPreview(plates: List<PlatePreview>): List<PlacedMeshData> {
     if (isEmpty()) return this
     if (totalVertexFloats() > MAX_PLACED_COMPACT_FLOATS) return this
-    val groups = if (plates.size >= 2) plates.map { it.meshes } else clusterSparseXyGroups()
+    val groups = if (plates.size >= 2) plates.map { it.meshes }.filter { it.isNotEmpty() } else clusterSparseXyGroups()
     if (groups.size <= 1) return compactedForPreview()
 
     // Move whole plates only. Repacking individual meshes breaks component transforms.
@@ -211,11 +220,47 @@ fun List<PlacedMeshData>.arrangedForAllPreview(plates: List<PlatePreview>): List
     return arranged.map { it.translated(recenter) }
 }
 
-private fun List<PlacedMeshData>.explicitPlatePreviews(plateName: (Int) -> String): List<PlatePreview> {
-    val explicit = mapNotNull { it.plateIndex }.distinct().sorted()
+private fun List<PlacedMeshData>.explicitPlatePreviews(
+    declaredPlateIndices: List<Int>,
+    plateName: (Int) -> String,
+): List<PlatePreview> {
+    val explicit = (declaredPlateIndices + mapNotNull { it.plateIndex }).distinct().sorted()
+    if (explicit.isEmpty()) return emptyList()
+
+    val meshIndicesByPlate = explicit.associateWith { mutableListOf<Int>() }
+    forEachIndexed { meshIndex, mesh ->
+        mesh.plateIndex?.let(meshIndicesByPlate::get)?.add(meshIndex)
+    }
+    val assignedIndices = meshIndicesByPlate.values.flatten().toSet()
+    val unassignedIndices = indices.filterNot { it in assignedIndices }
+    if (unassignedIndices.isNotEmpty()) {
+        val bounds = map { it.placedBounds() }
+        unassignedIndices.forEach { meshIndex ->
+            meshIndicesByPlate.entries
+                .filter { it.value.isNotEmpty() }
+                .minByOrNull { (_, plateMeshIndices) ->
+                    plateMeshIndices.minOf { plateMeshIndex ->
+                        bounds[meshIndex].xyDistanceSquaredTo(bounds[plateMeshIndex])
+                    }
+                }
+                ?.value
+                ?.add(meshIndex)
+        }
+    }
+
+    if (meshIndicesByPlate.values.all { it.isEmpty() }) {
+        // Some slicers declare plates but omit instance mappings; keep every mesh visible.
+        clusterSparseXyGroups().forEachIndexed { clusterIndex, cluster ->
+            val plate = explicit[minOf(clusterIndex, explicit.lastIndex)]
+            cluster.forEach { mesh ->
+                indexOfFirst { it === mesh }.takeIf { it >= 0 }?.let(meshIndicesByPlate.getValue(plate)::add)
+            }
+        }
+    }
+
     return explicit.map { plate ->
-        PlatePreview(plate, plateName(plate), filter { it.plateIndex == plate })
-    }.filter { it.meshes.isNotEmpty() }
+        PlatePreview(plate, plateName(plate), meshIndicesByPlate.getValue(plate).map(::get))
+    }
 }
 
 private fun List<PlacedMeshData>.clusterPlatePreviews(plateName: (Int) -> String): List<PlatePreview> {
@@ -322,6 +367,12 @@ private fun Bounds.inflatedXyOverlaps(other: Bounds, amount: Float): Boolean =
     min.x - amount <= other.max.x && max.x + amount >= other.min.x &&
         min.y - amount <= other.max.y && max.y + amount >= other.min.y
 
+private fun Bounds.xyDistanceSquaredTo(other: Bounds): Float {
+    val dx = maxOf(0.0f, min.x - other.max.x, other.min.x - max.x)
+    val dy = maxOf(0.0f, min.y - other.max.y, other.min.y - max.y)
+    return dx * dx + dy * dy
+}
+
 private fun PlacedMeshData.translated(delta: Vec3): PlacedMeshData {
     if (delta.x == 0.0f && delta.y == 0.0f && delta.z == 0.0f) return this
     return copy(previewOffset = previewOffset + delta)
@@ -375,29 +426,28 @@ object ThreeMfBuildParser {
     private var materialLayoutTotalMs: Long = 0
     private val PAINT_COLOR_BYTES = "paint_color".toByteArray()
 
-    fun hasExplicitMultiplePlates(file: File): Boolean {
-        val jsonPlates = ZipFile(file).use { zip ->
+    fun explicitPlateIndices(file: File): List<Int> = ZipFile(file).use { zip ->
+        buildSet {
             val plateFile = Regex("(?:^|/)plate[_-]?(\\d+)\\.json$", RegexOption.IGNORE_CASE)
             zip.entries().asSequence()
                 .mapNotNull { entry -> plateFile.find(entry.name)?.groupValues?.getOrNull(1)?.toIntOrNull() }
-                .distinct()
-                .take(2)
-                .count()
+                .forEach(::add)
+
+            addAll(readPlateConfig(zip).plateIndices)
+
+            val modelEntry = zip.getEntry(STANDARD_MODEL_PATH)
+                ?: zip.entries().asSequence().firstOrNull {
+                    !it.isDirectory && it.name.endsWith(".model", ignoreCase = true)
+                }
+            val modelSize = modelEntry?.size?.takeIf { it >= 0L } ?: modelEntry?.compressedSize ?: -1L
+            if (modelEntry != null && modelSize in 0L..MAX_MODEL_XML_PLATE_SCAN_BYTES) {
+                parseModelFromZip(zip)?.buildItems?.mapNotNullTo(this) { it.plateIndex }
+            }
         }
-        if (jsonPlates >= 2) return true
-
-        val configPlates = ZipFile(file).use { readConfigPlateInstances(it) }
-        if (configPlates.map { it.plateIndex }.distinct().take(2).count() >= 2) return true
-
-        if (modelEntrySize(file) > MAX_MODEL_XML_PLATE_SCAN_BYTES) return false
-
-        val scene = parseModel(file) ?: return false
-        return scene.buildItems
-            .mapNotNull { it.plateIndex }
-            .distinct()
-            .take(2)
-            .count() >= 2
+            .sorted()
     }
+
+    fun hasExplicitMultiplePlates(file: File): Boolean = explicitPlateIndices(file).size >= 2
 
     fun placedMeshes(
         file: File,
@@ -418,8 +468,8 @@ object ThreeMfBuildParser {
             val xmlBuildItems = scene?.buildItems.orEmpty()
             val xmlObjectIds = xmlBuildItems.map { it.objectId }.toSet()
             val jsonPlateByObjectId = readJsonPlateObjectIds(zip, xmlObjectIds)
-            val configInstances = readConfigPlateInstances(zip)
-            val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, configInstances)
+            val plateConfig = readPlateConfig(zip)
+            val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, plateConfig.assignments)
 
             val objectCount = scene?.objectsById?.size ?: 0
             val componentCount = scene?.objectsById?.values?.sumOf { it.components.size } ?: 0
@@ -446,7 +496,7 @@ object ThreeMfBuildParser {
                 }
             }.toSet()
 
-            val paintColorsByResource = readBambuPaintColors(zip, paintNeededIds)
+            val paintColorsByResource = readPaintColors(zip, paintNeededIds)
             paintColorsByResource.forEach { (resourceId, paintColors) ->
                 val digitCounts = paintColors.groupBy { it }.mapValues { it.value.size }
                 Log.d(THREE_MF_LOG_TAG, "Bambu paint_colors: resourceId=$resourceId, triangleCount=${paintColors.size}, digits=$digitCounts")
@@ -954,7 +1004,7 @@ object ThreeMfBuildParser {
         }.ifEmpty { listOf(VolumeMeshData(this, null)) }
     }
 
-    private fun readBambuPaintColors(
+    private fun readPaintColors(
         zip: ZipFile,
         neededIds: Set<Int>,
     ): Map<Int, IntArray> {
@@ -1182,10 +1232,6 @@ object ThreeMfBuildParser {
             .toMap()
     }.getOrNull()
 
-    private fun parseModel(file: File): ThreeMfScene? = ZipFile(file).use { zip ->
-        parseModelFromZip(zip)
-    }
-
     private fun parseModelFromZip(zip: ZipFile): ThreeMfScene? {
         val entry = zip.getEntry(STANDARD_MODEL_PATH)
             ?: zip.entries().asSequence().firstOrNull { !it.isDirectory && it.name.endsWith(".model", ignoreCase = true) }
@@ -1294,13 +1340,6 @@ object ThreeMfBuildParser {
         return ThreeMfScene(objects, buildItems)
     }
 
-    private fun modelEntrySize(file: File): Long = ZipFile(file).use { zip ->
-        val entry = zip.getEntry(STANDARD_MODEL_PATH)
-            ?: zip.entries().asSequence().firstOrNull { !it.isDirectory && it.name.endsWith(".model", ignoreCase = true) }
-            ?: return 0L
-        entry.size.takeIf { it >= 0L } ?: entry.compressedSize
-    }
-
     private fun List<PlacedMeshData>.withUniqueNames(): List<PlacedMeshData> {
         val totals = groupingBy { it.name }.eachCount()
         val seen = mutableMapOf<String, Int>()
@@ -1386,18 +1425,19 @@ object ThreeMfBuildParser {
     private fun String?.orObjectName(objectId: Int): String =
         this?.takeIf { it.isNotBlank() } ?: "Object $objectId"
 
-    private fun readConfigPlateInstances(zip: ZipFile): List<PlateInstanceAssignment> {
+    private fun readPlateConfig(zip: ZipFile): PlateConfig {
         val entry = zip.getEntry(CONFIG_PATH)
             ?: zip.entries().asSequence().firstOrNull {
                 !it.isDirectory && it.name.endsWith("model_settings.config", ignoreCase = true)
             }
-            ?: return emptyList()
+            ?: return PlateConfig.EMPTY
         return zip.getInputStream(entry).use { input ->
-            runCatching { parseConfigPlateInstances(input) }.getOrDefault(emptyList())
+            runCatching { parsePlateConfig(input) }.getOrDefault(PlateConfig.EMPTY)
         }
     }
 
-    private fun parseConfigPlateInstances(input: java.io.InputStream): List<PlateInstanceAssignment> {
+    private fun parsePlateConfig(input: java.io.InputStream): PlateConfig {
+        val plateIndices = linkedSetOf<Int>()
         val assignments = mutableListOf<PlateInstanceAssignment>()
         var currentPlateId: Int? = null
         var inModelInstance = false
@@ -1422,7 +1462,7 @@ object ThreeMfBuildParser {
                         } else if (inModelInstance && key == "instance_id") {
                             currentInstanceId = value.toIntOrNull()
                         } else if (!inModelInstance && key == "plater_id") {
-                            currentPlateId = value.toIntOrNull()
+                            currentPlateId = value.toIntOrNull()?.also(plateIndices::add)
                         }
                     }
                 }
@@ -1437,10 +1477,6 @@ object ThreeMfBuildParser {
                         if (plate != null && objectId != null) {
                             assignments += PlateInstanceAssignment(plate, objectId, currentInstanceId)
                         }
-                        Log.d(
-                            THREE_MF_LOG_TAG,
-                            "Plate config instance: plate=$currentPlateId, objectId=$currentObjectId, instanceId=$currentInstanceId",
-                        )
                         inModelInstance = false
                     }
                     "plate" -> currentPlateId = null
@@ -1449,7 +1485,7 @@ object ThreeMfBuildParser {
         }
 
         saxParser.parse(input, handler)
-        return assignments
+        return PlateConfig(plateIndices.toList(), assignments)
     }
 
     private fun matchConfigPlatesToBuildItems(
@@ -1543,6 +1579,14 @@ private data class ThreeMfComponent(val objectId: Int, val transform: MeshTransf
 private data class ThreeMfBuildItem(val objectId: Int, val transform: MeshTransform, val plateIndex: Int?)
 private data class PendingBuildItem(val objectId: Int, val transform: MeshTransform, var plateIndex: Int?)
 private data class PlateInstanceAssignment(val plateIndex: Int, val objectId: Int, val instanceId: Int?)
+private data class PlateConfig(
+    val plateIndices: List<Int>,
+    val assignments: List<PlateInstanceAssignment>,
+) {
+    companion object {
+        val EMPTY = PlateConfig(emptyList(), emptyList())
+    }
+}
 
 private const val MAX_MODEL_XML_PLATE_SCAN_BYTES = 16L * 1024L * 1024L
 private const val MAX_PLACED_COMPACT_FLOATS = 3_000_000L
