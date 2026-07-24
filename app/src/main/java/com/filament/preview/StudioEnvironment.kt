@@ -27,8 +27,9 @@ class StudioEnvironment private constructor(
     }
 
     companion object {
-        private const val WIDTH = 128
-        private const val HEIGHT = 64
+        // Keep enough angular detail for stable, continuous highlights after specular prefiltering.
+        private const val WIDTH = 256
+        private const val HEIGHT = 128
 
         fun create(engine: Engine): StudioEnvironment {
             val radiance = buildStudioRadiance(WIDTH, HEIGHT)

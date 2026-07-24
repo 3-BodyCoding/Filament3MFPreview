@@ -3,8 +3,11 @@ package com.filament.preview
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.pow
+import kotlin.math.sqrt
 
 object GlbSceneBuilder {
     const val BASE_PLATE_NODE = "baseplate"
@@ -35,25 +38,30 @@ object GlbSceneBuilder {
 
         val meshDefinitions = mutableListOf<MeshDefinition>()
         meshes.forEachIndexed { index, mesh ->
+            // Build smoothing groups on the complete surface before splitting it by material.
+            val shading = MeshShading(mesh.vertices, mesh.indices, MODEL_CREASE_ANGLE_DEGREES)
             val layout = mesh.materialLayout
             val primitives = if (layout == null || layout.primitives.isEmpty()) {
                 modelColors += overrideColor ?: mesh.displayColor ?: DEFAULT_MODEL_COLOR
-                listOf(Primitive(mesh.vertices, mesh.indices, modelColors.lastIndex, 4))
+                shading.indexedGeometry(mesh.indices)?.let { geometry ->
+                    listOf(Primitive(geometry.vertices, geometry.indices, modelColors.lastIndex, 4, normals = geometry.normals))
+                }.orEmpty()
             } else {
                 layout.primitives.mapNotNull { source ->
                     val cornerSlots = source.cornerMaterialSlotIndices
                     if (cornerSlots != null) {
                         vertexColorPrimitive(
-                            mesh = mesh,
                             source = source,
                             slots = layout.slots,
                             materialIndex = materialForVertexColors(),
                             overrideColor = overrideColor,
                             colorOverrides = colorOverrides,
+                            shading = shading,
                         )
                     } else {
                         val slot = layout.slots.getOrNull(source.materialSlotIndex) ?: return@mapNotNull null
-                        Primitive(mesh.vertices, source.indices, materialFor(slot), 4)
+                        val geometry = shading.indexedGeometry(source.indices) ?: return@mapNotNull null
+                        Primitive(geometry.vertices, geometry.indices, materialFor(slot), 4, normals = geometry.normals)
                     }
                 }
             }
@@ -207,29 +215,26 @@ object GlbSceneBuilder {
     }
 
     private fun vertexColorPrimitive(
-        mesh: SceneMesh,
         source: MeshMaterialPrimitive,
         slots: List<MaterialSlot>,
         materialIndex: Int,
         overrideColor: FloatArray?,
         colorOverrides: Map<MaterialSlotId, RgbaColor>,
+        shading: MeshShading,
     ): Primitive? {
         val cornerSlots = source.cornerMaterialSlotIndices ?: return null
         if (cornerSlots.size != source.indices.size) return null
-        val vertices = FloatArray(source.indices.size * 3)
+        val geometry = shading.expandedGeometry(source.indices) ?: return null
         val colors = FloatArray(source.indices.size * 4)
         val indices = IntArray(source.indices.size) { it }
-        source.indices.forEachIndexed { corner, sourceVertex ->
-            val sourceOffset = sourceVertex * 3
-            if (sourceOffset < 0 || sourceOffset + 2 >= mesh.vertices.size) return null
-            mesh.vertices.copyInto(vertices, corner * 3, sourceOffset, sourceOffset + 3)
+        source.indices.forEachIndexed { corner, _ ->
             val slot = slots.getOrNull(cornerSlots[corner])
             val color = overrideColor
                 ?: slot?.let { colorOverrides[it.id]?.toFloatArray() ?: it.originalColor.toFloatArray() }
                 ?: DEFAULT_MODEL_COLOR
             color.srgbToLinearRgba().copyInto(colors, corner * 4, 0, 4)
         }
-        return Primitive(vertices, indices, materialIndex, 4, colors)
+        return Primitive(geometry.vertices, indices, materialIndex, 4, colors, geometry.normals)
     }
 
     private fun markerPrimitives(bounds: Bounds, materialStart: Int): List<Primitive> {
@@ -351,8 +356,8 @@ object GlbSceneBuilder {
         val materialIndex: Int,
         val mode: Int,
         val colors: FloatArray? = null,
+        val normals: FloatArray = computeVertexNormals(vertices, indices),
     ) {
-        val normals: FloatArray = computeVertexNormals(vertices, indices)
         val indexComponentType: Int = if (vertices.size / 3 <= UShort.MAX_VALUE.toInt()) 5123 else 5125
         val indexByteLength: Int = indices.size * if (indexComponentType == 5123) 2 else 4
 
@@ -399,6 +404,8 @@ object GlbSceneBuilder {
 
     internal const val MODEL_METALLIC = 0.0f
     internal const val MODEL_ROUGHNESS = 0.38f
+    // Preserve the relatively shallow manufactured creases commonly found in sliced 3MF parts.
+    internal const val MODEL_CREASE_ANGLE_DEGREES = 30.0f
 }
 
 internal fun FloatArray.srgbToLinearRgba(): FloatArray = copyOf().also { linear ->
@@ -411,6 +418,285 @@ internal fun FloatArray.srgbToLinearRgba(): FloatArray = copyOf().also { linear 
         }
     }
 }
+
+private class MeshShading(
+    private val sourceVertices: FloatArray,
+    private val sourceIndices: IntArray,
+    creaseAngleDegrees: Float,
+) {
+    private val cornerNormals = computeCreaseAwareCornerNormals(sourceVertices, sourceIndices, creaseAngleDegrees)
+    private val fallbackNormals = computeVertexNormals(sourceVertices, sourceIndices)
+    private val triangleOffsets = linkedMapOf<TriangleKey, MutableList<Int>>()
+    private val nextTriangleByKey = mutableMapOf<TriangleKey, Int>()
+
+    init {
+        var offset = 0
+        while (offset + 2 < sourceIndices.size) {
+            val key = TriangleKey(sourceIndices[offset], sourceIndices[offset + 1], sourceIndices[offset + 2])
+            triangleOffsets.getOrPut(key) { mutableListOf() }.add(offset)
+            offset += 3
+        }
+    }
+
+    fun indexedGeometry(indices: IntArray): PrimitiveGeometry? {
+        if (indices.isEmpty()) return null
+        val sourceTriangleOffsets = resolveTriangleOffsets(indices)
+        val vertices = FloatCollector()
+        val normals = FloatCollector()
+        val remappedIndices = IntArray(indices.size)
+        val vertexByKey = HashMap<ShadedVertexKey, Int>()
+        indices.forEachIndexed { corner, sourceVertex ->
+            val sourceOffset = sourceVertex * 3
+            if (sourceOffset < 0 || sourceOffset + 2 >= sourceVertices.size) return null
+            val resolvedNormalOffset = resolvedNormalOffset(sourceTriangleOffsets[corner / 3], corner % 3, sourceVertex)
+            val normalSource = if (resolvedNormalOffset >= 0) cornerNormals else fallbackNormals
+            val normalOffset = if (resolvedNormalOffset >= 0) resolvedNormalOffset else -resolvedNormalOffset - 1
+            val normalX = normalSource[normalOffset]
+            val normalY = normalSource[normalOffset + 1]
+            val normalZ = normalSource[normalOffset + 2]
+            val key = ShadedVertexKey(sourceVertex, normalX.toBits(), normalY.toBits(), normalZ.toBits())
+            remappedIndices[corner] = vertexByKey.getOrPut(key) {
+                vertices.add(sourceVertices[sourceOffset])
+                vertices.add(sourceVertices[sourceOffset + 1])
+                vertices.add(sourceVertices[sourceOffset + 2])
+                normals.add(normalX)
+                normals.add(normalY)
+                normals.add(normalZ)
+                vertexByKey.size
+            }
+        }
+        return PrimitiveGeometry(vertices.toFloatArray(), normals.toFloatArray(), remappedIndices)
+    }
+
+    fun expandedGeometry(indices: IntArray): PrimitiveGeometry? {
+        if (indices.isEmpty()) return null
+        val sourceTriangleOffsets = resolveTriangleOffsets(indices)
+        val vertices = FloatArray(indices.size * 3)
+        val normals = FloatArray(indices.size * 3)
+        indices.forEachIndexed { corner, sourceVertex ->
+            val sourceOffset = sourceVertex * 3
+            if (sourceOffset < 0 || sourceOffset + 2 >= sourceVertices.size) return null
+            sourceVertices.copyInto(vertices, corner * 3, sourceOffset, sourceOffset + 3)
+            val resolvedNormalOffset = resolvedNormalOffset(sourceTriangleOffsets[corner / 3], corner % 3, sourceVertex)
+            val normalSource = if (resolvedNormalOffset >= 0) cornerNormals else fallbackNormals
+            val normalOffset = if (resolvedNormalOffset >= 0) resolvedNormalOffset else -resolvedNormalOffset - 1
+            normals[corner * 3] = normalSource[normalOffset]
+            normals[corner * 3 + 1] = normalSource[normalOffset + 1]
+            normals[corner * 3 + 2] = normalSource[normalOffset + 2]
+        }
+        return PrimitiveGeometry(vertices, normals, IntArray(indices.size) { it })
+    }
+
+    private fun resolveTriangleOffsets(indices: IntArray): IntArray {
+        val resolved = IntArray((indices.size + 2) / 3) { -1 }
+        var offset = 0
+        while (offset + 2 < indices.size) {
+            val key = TriangleKey(indices[offset], indices[offset + 1], indices[offset + 2])
+            val candidates = triangleOffsets[key]
+            val next = nextTriangleByKey.getOrDefault(key, 0)
+            if (candidates != null && next < candidates.size) {
+                resolved[offset / 3] = candidates[next]
+                nextTriangleByKey[key] = next + 1
+            }
+            offset += 3
+        }
+        return resolved
+    }
+
+    private fun resolvedNormalOffset(triangleOffset: Int, localCorner: Int, sourceVertex: Int): Int {
+        if (triangleOffset >= 0) {
+            val normalOffset = (triangleOffset + localCorner) * 3
+            if (normalOffset + 2 < cornerNormals.size) return normalOffset
+        }
+        return -(sourceVertex * 3) - 1
+    }
+}
+
+internal fun computeCreaseAwareCornerNormals(
+    vertices: FloatArray,
+    indices: IntArray,
+    creaseAngleDegrees: Float,
+): FloatArray {
+    val triangleCount = indices.size / 3
+    val faceNormals = FloatArray(triangleCount * 3)
+    val cornerAngles = FloatArray(triangleCount * 3)
+    val validFaces = BooleanArray(triangleCount)
+    val edgeUses = HashMap<Long, EdgePair>()
+
+    for (triangle in 0 until triangleCount) {
+        val corner = triangle * 3
+        val i0 = indices[corner] * 3
+        val i1 = indices[corner + 1] * 3
+        val i2 = indices[corner + 2] * 3
+        if (!validVertexOffset(i0, vertices) || !validVertexOffset(i1, vertices) || !validVertexOffset(i2, vertices)) continue
+        val ux = vertices[i1] - vertices[i0]
+        val uy = vertices[i1 + 1] - vertices[i0 + 1]
+        val uz = vertices[i1 + 2] - vertices[i0 + 2]
+        val vx = vertices[i2] - vertices[i0]
+        val vy = vertices[i2 + 1] - vertices[i0 + 1]
+        val vz = vertices[i2 + 2] - vertices[i0 + 2]
+        val nx = uy * vz - uz * vy
+        val ny = uz * vx - ux * vz
+        val nz = ux * vy - uy * vx
+        val length = sqrt(nx * nx + ny * ny + nz * nz)
+        if (length <= NORMAL_EPSILON) continue
+        faceNormals[corner] = nx / length
+        faceNormals[corner + 1] = ny / length
+        faceNormals[corner + 2] = nz / length
+        cornerAngles[corner] = cornerAngle(vertices, i0, i1, i2)
+        cornerAngles[corner + 1] = cornerAngle(vertices, i1, i2, i0)
+        cornerAngles[corner + 2] = cornerAngle(vertices, i2, i0, i1)
+        validFaces[triangle] = true
+        addEdgeUse(edgeUses, indices, corner, corner + 1, triangle)
+        addEdgeUse(edgeUses, indices, corner + 1, corner + 2, triangle)
+        addEdgeUse(edgeUses, indices, corner + 2, corner, triangle)
+    }
+
+    val groups = DisjointSet(triangleCount * 3)
+    val creaseCosine = cos(Math.toRadians(creaseAngleDegrees.toDouble())).toFloat()
+    edgeUses.values.forEach { uses ->
+        val second = uses.second ?: return@forEach
+        if (!uses.isManifold) return@forEach
+        val first = uses.first
+        val firstFace = first.triangle * 3
+        val secondFace = second.triangle * 3
+        val dot = faceNormals[firstFace] * faceNormals[secondFace] +
+            faceNormals[firstFace + 1] * faceNormals[secondFace + 1] +
+            faceNormals[firstFace + 2] * faceNormals[secondFace + 2]
+        if (dot + 1e-6f < creaseCosine) return@forEach
+        unionMatchingEndpoint(groups, indices, first.firstCorner, second.firstCorner, second.secondCorner)
+        unionMatchingEndpoint(groups, indices, first.secondCorner, second.firstCorner, second.secondCorner)
+    }
+
+    val groupedNormals = FloatArray(triangleCount * 3 * 3)
+    for (corner in 0 until triangleCount * 3) {
+        val triangle = corner / 3
+        if (!validFaces[triangle]) continue
+        val faceOffset = triangle * 3
+        val rootOffset = groups.find(corner) * 3
+        val weight = cornerAngles[corner]
+        groupedNormals[rootOffset] += faceNormals[faceOffset] * weight
+        groupedNormals[rootOffset + 1] += faceNormals[faceOffset + 1] * weight
+        groupedNormals[rootOffset + 2] += faceNormals[faceOffset + 2] * weight
+    }
+
+    val result = FloatArray(triangleCount * 3 * 3)
+    for (corner in 0 until triangleCount * 3) {
+        val triangle = corner / 3
+        val outputOffset = corner * 3
+        val rootOffset = groups.find(corner) * 3
+        val x = groupedNormals[rootOffset]
+        val y = groupedNormals[rootOffset + 1]
+        val z = groupedNormals[rootOffset + 2]
+        val length = sqrt(x * x + y * y + z * z)
+        if (length > NORMAL_EPSILON) {
+            result[outputOffset] = x / length
+            result[outputOffset + 1] = y / length
+            result[outputOffset + 2] = z / length
+        } else if (validFaces[triangle]) {
+            val faceOffset = triangle * 3
+            result[outputOffset] = faceNormals[faceOffset]
+            result[outputOffset + 1] = faceNormals[faceOffset + 1]
+            result[outputOffset + 2] = faceNormals[faceOffset + 2]
+        } else {
+            result[outputOffset + 2] = 1.0f
+        }
+    }
+    return result
+}
+
+private fun validVertexOffset(offset: Int, vertices: FloatArray): Boolean =
+    offset >= 0 && offset + 2 < vertices.size
+
+private fun cornerAngle(vertices: FloatArray, corner: Int, adjacentA: Int, adjacentB: Int): Float {
+    val ax = vertices[adjacentA] - vertices[corner]
+    val ay = vertices[adjacentA + 1] - vertices[corner + 1]
+    val az = vertices[adjacentA + 2] - vertices[corner + 2]
+    val bx = vertices[adjacentB] - vertices[corner]
+    val by = vertices[adjacentB + 1] - vertices[corner + 1]
+    val bz = vertices[adjacentB + 2] - vertices[corner + 2]
+    val crossX = ay * bz - az * by
+    val crossY = az * bx - ax * bz
+    val crossZ = ax * by - ay * bx
+    val crossLength = sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ)
+    val dot = ax * bx + ay * by + az * bz
+    return atan2(crossLength, dot).takeIf { it.isFinite() } ?: 0.0f
+}
+
+private fun addEdgeUse(
+    edges: MutableMap<Long, EdgePair>,
+    indices: IntArray,
+    firstCorner: Int,
+    secondCorner: Int,
+    triangle: Int,
+) {
+    val firstVertex = indices[firstCorner]
+    val secondVertex = indices[secondCorner]
+    if (firstVertex < 0 || secondVertex < 0 || firstVertex == secondVertex) return
+    val min = minOf(firstVertex, secondVertex)
+    val max = maxOf(firstVertex, secondVertex)
+    val key = (min.toLong() shl 32) or (max.toLong() and 0xffffffffL)
+    val use = EdgeUse(triangle, firstCorner, secondCorner)
+    val pair = edges[key]
+    when {
+        pair == null -> edges[key] = EdgePair(use)
+        pair.second == null -> pair.second = use
+        else -> pair.isManifold = false
+    }
+}
+
+private fun unionMatchingEndpoint(
+    groups: DisjointSet,
+    indices: IntArray,
+    sourceCorner: Int,
+    candidateA: Int,
+    candidateB: Int,
+) {
+    when (indices[sourceCorner]) {
+        indices[candidateA] -> groups.union(sourceCorner, candidateA)
+        indices[candidateB] -> groups.union(sourceCorner, candidateB)
+    }
+}
+
+private class DisjointSet(size: Int) {
+    private val parent = IntArray(size) { it }
+
+    fun find(value: Int): Int {
+        var root = value
+        while (parent[root] != root) root = parent[root]
+        var current = value
+        while (parent[current] != current) {
+            val next = parent[current]
+            parent[current] = root
+            current = next
+        }
+        return root
+    }
+
+    fun union(first: Int, second: Int) {
+        val firstRoot = find(first)
+        val secondRoot = find(second)
+        if (firstRoot != secondRoot) parent[secondRoot] = firstRoot
+    }
+}
+
+private class FloatCollector(initialCapacity: Int = 256) {
+    private var values = FloatArray(initialCapacity)
+    private var size = 0
+
+    fun add(value: Float) {
+        if (size == values.size) values = values.copyOf(max(1, values.size * 2))
+        values[size++] = value
+    }
+
+    fun toFloatArray(): FloatArray = values.copyOf(size)
+}
+
+private data class TriangleKey(val first: Int, val second: Int, val third: Int)
+private data class ShadedVertexKey(val sourceVertex: Int, val normalX: Int, val normalY: Int, val normalZ: Int)
+private data class PrimitiveGeometry(val vertices: FloatArray, val normals: FloatArray, val indices: IntArray)
+private data class EdgeUse(val triangle: Int, val firstCorner: Int, val secondCorner: Int)
+private data class EdgePair(val first: EdgeUse, var second: EdgeUse? = null, var isManifold: Boolean = true)
 
 internal fun computeVertexNormals(vertices: FloatArray, indices: IntArray): FloatArray {
     val normals = FloatArray(vertices.size)
@@ -432,15 +718,21 @@ internal fun computeVertexNormals(vertices: FloatArray, indices: IntArray): Floa
         val nx = uy * vz - uz * vy
         val ny = uz * vx - ux * vz
         val nz = ux * vy - uy * vx
-        normals[i0] += nx; normals[i0 + 1] += ny; normals[i0 + 2] += nz
-        normals[i1] += nx; normals[i1 + 1] += ny; normals[i1 + 2] += nz
-        normals[i2] += nx; normals[i2 + 1] += ny; normals[i2 + 2] += nz
+        val faceLength = sqrt(nx * nx + ny * ny + nz * nz)
+        if (faceLength > NORMAL_EPSILON) {
+            val unitX = nx / faceLength
+            val unitY = ny / faceLength
+            val unitZ = nz / faceLength
+            accumulateCornerNormal(normals, i0, i1, i2, vertices, unitX, unitY, unitZ)
+            accumulateCornerNormal(normals, i1, i2, i0, vertices, unitX, unitY, unitZ)
+            accumulateCornerNormal(normals, i2, i0, i1, vertices, unitX, unitY, unitZ)
+        }
         i += 3
     }
     var n = 0
     while (n + 2 < normals.size) {
-        val length = kotlin.math.sqrt(normals[n] * normals[n] + normals[n + 1] * normals[n + 1] + normals[n + 2] * normals[n + 2])
-        if (length > 1e-6f) {
+        val length = sqrt(normals[n] * normals[n] + normals[n + 1] * normals[n + 1] + normals[n + 2] * normals[n + 2])
+        if (length > NORMAL_EPSILON) {
             normals[n] /= length
             normals[n + 1] /= length
             normals[n + 2] /= length
@@ -451,3 +743,33 @@ internal fun computeVertexNormals(vertices: FloatArray, indices: IntArray): Floa
     }
     return normals
 }
+
+private fun accumulateCornerNormal(
+    normals: FloatArray,
+    corner: Int,
+    adjacentA: Int,
+    adjacentB: Int,
+    vertices: FloatArray,
+    faceX: Float,
+    faceY: Float,
+    faceZ: Float,
+) {
+    val ax = vertices[adjacentA] - vertices[corner]
+    val ay = vertices[adjacentA + 1] - vertices[corner + 1]
+    val az = vertices[adjacentA + 2] - vertices[corner + 2]
+    val bx = vertices[adjacentB] - vertices[corner]
+    val by = vertices[adjacentB + 1] - vertices[corner + 1]
+    val bz = vertices[adjacentB + 2] - vertices[corner + 2]
+    val crossX = ay * bz - az * by
+    val crossY = az * bx - ax * bz
+    val crossZ = ax * by - ay * bx
+    val crossLength = sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ)
+    val dot = ax * bx + ay * by + az * bz
+    val angle = atan2(crossLength, dot)
+    if (!angle.isFinite() || angle <= 0.0f) return
+    normals[corner] += faceX * angle
+    normals[corner + 1] += faceY * angle
+    normals[corner + 2] += faceZ * angle
+}
+
+private const val NORMAL_EPSILON = 1e-12f

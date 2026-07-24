@@ -69,7 +69,10 @@ import com.google.android.filament.utils.Utils
 import io.lib3mf.android.open3mf
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.asin
@@ -87,6 +90,10 @@ class MainActivity : ComponentActivity() {
     private var filamentSurface: SurfaceView? = null
     private val pickHandler by lazy { Handler(Looper.getMainLooper()) }
     private val choreographer by lazy { Choreographer.getInstance() }
+    private val modelBuildExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "glb-builder").apply { isDaemon = true }
+    }
+    private val modelBuildGeneration = AtomicInteger()
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             choreographer.postFrameCallback(this)
@@ -179,6 +186,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        modelBuildGeneration.incrementAndGet()
+        modelBuildExecutor.shutdownNow()
         super.onDestroy()
         choreographer.removeFrameCallback(frameCallback)
         modelViewer?.let { viewer ->
@@ -319,6 +328,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun load3mf(uri: Uri) {
+        // A result prepared for the previous file must never replace the newly selected model.
+        modelBuildGeneration.incrementAndGet()
         isLoading = true
         status = getString(R.string.status_loading)
         selectedIndex = null
@@ -497,23 +508,25 @@ class MainActivity : ComponentActivity() {
 
     private fun applyCurrentPreview() {
         if (loadedPlacedMeshes.isEmpty()) return
-        meshes = runCatching {
-            val selectedPlate = plates.getOrNull(selectedPlateIndex)
-            val placed = when {
-                previewMode == PreviewMode.Plate && selectedPlate != null -> {
-                    selectedPlate.meshes
-                }
-                plates.size >= 2 -> loadedPlacedMeshes.arrangedForAllPreview(plates)
-                else -> loadedPlacedMeshes
-            }
-            placed.toSceneMeshes()
-        }.getOrElse {
-            runCatching { loadedPlacedMeshes.toSceneMeshes() }.getOrDefault(emptyList())
-        }
+        val requestedMode = previewMode
+        val selectedPlate = plates.getOrNull(selectedPlateIndex)
+        val allPlacedMeshes = loadedPlacedMeshes
+        val currentPlates = plates
         selectedIndex = null
-        resetOrbitCamera()
-        reloadModel()
-        updateStatus()
+        selectedIndices = emptySet()
+        requestModelBuild(
+            sceneMeshes = {
+                val placed = when {
+                    requestedMode == PreviewMode.Plate && selectedPlate != null -> selectedPlate.meshes
+                    currentPlates.size >= 2 -> allPlacedMeshes.arrangedForAllPreview(currentPlates)
+                    else -> allPlacedMeshes
+                }
+                runCatching { placed.toSceneMeshes() }
+                    .getOrElse { allPlacedMeshes.toSceneMeshes() }
+            },
+            replaceSceneMeshes = true,
+            resetCamera = true,
+        )
     }
 
     private fun List<PlacedMeshData>.toSceneMeshes(): List<SceneMesh> {
@@ -571,26 +584,72 @@ class MainActivity : ComponentActivity() {
 
     private fun reloadModel() {
         val currentMeshes = meshes
-        val viewer = modelViewer ?: return
-        if (currentMeshes.isEmpty()) {
-            viewer.destroyModel()
-            cacheSceneEntities()
-            updateAxisLabels()
-            return
-        }
-        viewer.destroyModel()
         modelColorController.replaceAvailableSlots(currentMeshes)
         refreshEditableColors()
-        val tFilamentStart = System.currentTimeMillis()
-        val glb = GlbSceneBuilder.build(
-            currentMeshes,
-            null,
-            modelColorController.overrideSnapshot(),
+        requestModelBuild(
+            sceneMeshes = { currentMeshes },
+            replaceSceneMeshes = false,
+            resetCamera = false,
         )
-        val tGlbDone = System.currentTimeMillis()
-        viewer.loadModelGlb(glb)
-        val tLoadDone = System.currentTimeMillis()
-        Log.d("ThreeMfPerf", "createFilament: ${tLoadDone - tFilamentStart} ms (GLB=${tGlbDone - tFilamentStart} ms, load=${tLoadDone - tGlbDone} ms)")
+    }
+
+    private fun requestModelBuild(
+        sceneMeshes: () -> List<SceneMesh>,
+        replaceSceneMeshes: Boolean,
+        resetCamera: Boolean,
+    ) {
+        val requestId = modelBuildGeneration.incrementAndGet()
+        val colorOverrides = modelColorController.overrideSnapshot()
+        val requestedAt = System.currentTimeMillis()
+        modelBuildExecutor.execute modelBuild@{
+            if (requestId != modelBuildGeneration.get()) return@modelBuild
+            val prepared = runCatching {
+                val transformStart = System.currentTimeMillis()
+                val preparedMeshes = sceneMeshes()
+                val transformDone = System.currentTimeMillis()
+                if (requestId != modelBuildGeneration.get()) return@modelBuild
+                val glb = preparedMeshes.takeIf { it.isNotEmpty() }?.let {
+                    GlbSceneBuilder.build(it, null, colorOverrides)
+                }
+                PreparedModel(
+                    meshes = preparedMeshes,
+                    glb = glb,
+                    transformMs = transformDone - transformStart,
+                    buildMs = System.currentTimeMillis() - transformDone,
+                )
+            }
+            runOnUiThread {
+                if (requestId != modelBuildGeneration.get() || isDestroyed) return@runOnUiThread
+                prepared.onSuccess { model ->
+                    if (replaceSceneMeshes) meshes = model.meshes
+                    modelColorController.replaceAvailableSlots(model.meshes)
+                    refreshEditableColors()
+                    if (resetCamera) resetOrbitCamera()
+                    applyPreparedModel(model, requestedAt)
+                    updateStatus()
+                }.onFailure { error ->
+                    Log.e("ThreeMfPerf", "GLB preparation failed", error)
+                    Toast.makeText(
+                        this,
+                        error.message ?: error.javaClass.simpleName,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun applyPreparedModel(model: PreparedModel, requestedAt: Long) {
+        val viewer = modelViewer ?: return
+        val loadStart = System.currentTimeMillis()
+        viewer.destroyModel()
+        model.glb?.let { viewer.loadModelGlb(it) }
+        val loadDone = System.currentTimeMillis()
+        Log.d(
+            "ThreeMfPerf",
+            "createFilament: ${loadDone - requestedAt} ms " +
+                "(transform=${model.transformMs} ms, GLB=${model.buildMs} ms, load=${loadDone - loadStart} ms)",
+        )
         updateOrbitCamera()
         cacheSceneEntities()
         applySceneVisibility()
@@ -606,10 +665,13 @@ class MainActivity : ComponentActivity() {
         viewer.view.antiAliasing = View.AntiAliasing.FXAA
         viewer.view.ambientOcclusionOptions = View.AmbientOcclusionOptions().apply {
             enabled = true
-            radius = 0.28f
-            intensity = 0.45f
-            power = 0.8f
-            quality = View.QualityLevel.LOW
+            // Scene geometry is normalized to a maximum span of 2, so keep AO local to small cavities.
+            radius = 0.06f
+            intensity = 0.32f
+            power = 1.0f
+            quality = View.QualityLevel.HIGH
+            lowPassFilter = View.QualityLevel.HIGH
+            upsampling = View.QualityLevel.HIGH
         }
         viewer.view.isTransparentPickingEnabled = false
 
@@ -822,6 +884,13 @@ private data class Loaded3mf(
     val meshes: List<PlacedMeshData>,
     val plates: List<PlatePreview>,
     val initialSceneMeshes: List<SceneMesh>?,
+)
+
+private data class PreparedModel(
+    val meshes: List<SceneMesh>,
+    val glb: ByteBuffer?,
+    val transformMs: Long,
+    val buildMs: Long,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
