@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.Choreographer
@@ -67,10 +68,18 @@ import com.google.android.filament.View
 import com.google.android.filament.utils.ModelViewer
 import com.google.android.filament.utils.Utils
 import io.lib3mf.android.open3mf
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
@@ -85,7 +94,9 @@ import kotlin.math.sqrt
 import kotlin.math.tan
 
 class MainActivity : ComponentActivity() {
+    @Volatile
     private var modelViewer: ModelViewer? = null
+    @Volatile
     private var studioEnvironment: StudioEnvironment? = null
     private var filamentSurface: SurfaceView? = null
     private val pickHandler by lazy { Handler(Looper.getMainLooper()) }
@@ -93,11 +104,22 @@ class MainActivity : ComponentActivity() {
     private val modelBuildExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "glb-builder").apply { isDaemon = true }
     }
+    private val viewPrebuildExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "view-prebuild").apply { isDaemon = true }
+    }
+    private val filamentThread = HandlerThread("filament-thread").also { it.start() }
+    private val filamentHandler = Handler(filamentThread.looper)
+    private val filamentScope = CoroutineScope(SupervisorJob() + filamentHandler.asCoroutineDispatcher())
     private val modelBuildGeneration = AtomicInteger()
+    private val viewCache = ConcurrentHashMap<String, PreparedModel>()
+    @Volatile
+    private var colorVersion = 0
+    @Volatile
+    private var prewarmLoadId = 0
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             choreographer.postFrameCallback(this)
-            modelViewer?.render(frameTimeNanos)
+            filamentScope.launch { modelViewer?.render(frameTimeNanos) }
             updateAxisLabels()
         }
     }
@@ -124,6 +146,8 @@ class MainActivity : ComponentActivity() {
     private var orbitRadius = sqrt(3.2 * 3.2 + 2.2 * 2.2)
     private var orbitTarget = Vec3(0.0f, 0.0f, 0.0f)
     private val modelColorController = ModelColorController {
+        colorVersion++
+        viewCache.clear()
         runOnUiThread { reloadModel() }
     }
 
@@ -188,32 +212,43 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         modelBuildGeneration.incrementAndGet()
         modelBuildExecutor.shutdownNow()
-        super.onDestroy()
+        viewPrebuildExecutor.shutdownNow()
         choreographer.removeFrameCallback(frameCallback)
-        modelViewer?.let { viewer ->
-            viewer.scene.skybox = null
-            viewer.scene.indirectLight = null
-            studioEnvironment?.destroy(viewer.engine)
-            viewer.destroy()
+        filamentScope.launch {
+            modelViewer?.let { viewer ->
+                viewer.scene.skybox = null
+                viewer.scene.indirectLight = null
+                studioEnvironment?.destroy(viewer.engine)
+                viewer.destroy()
+            }
+            modelViewer = null
+            filamentThread.quitSafely()
         }
-        studioEnvironment = null
-        modelViewer = null
+        super.onDestroy()
     }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupFilament(surfaceView: SurfaceView) {
         if (modelViewer != null) return
         filamentSurface = surfaceView
-        modelViewer = ModelViewer(surfaceView, manipulator = null).also { viewer ->
-            val environment = runCatching { StudioEnvironment.create(viewer.engine) }
-                .onFailure { Log.e("FilamentPreview", "Studio IBL creation failed; using fallback lighting", it) }
-                .getOrElse { StudioEnvironment.createFallback(viewer.engine) }
-            studioEnvironment = environment
-            viewer.scene.skybox = environment.skybox
-            viewer.scene.indirectLight = environment.indirectLight
-            configureFilamentView(viewer)
-            updateOrbitCamera()
+        val latch = CountDownLatch(1)
+        filamentScope.launch {
+            try {
+                val viewer = ModelViewer(surfaceView, manipulator = null)
+                val environment = runCatching { StudioEnvironment.create(viewer.engine) }
+                    .onFailure { Log.e("FilamentPreview", "Studio IBL creation failed; using fallback lighting", it) }
+                    .getOrElse { StudioEnvironment.createFallback(viewer.engine) }
+                studioEnvironment = environment
+                viewer.scene.skybox = environment.skybox
+                viewer.scene.indirectLight = environment.indirectLight
+                configureFilamentView(viewer)
+                modelViewer = viewer
+            } finally {
+                latch.countDown()
+            }
         }
+        latch.await()
+        updateOrbitCamera()
         val tapSlop = ViewConfiguration.get(surfaceView.context).scaledTouchSlop.toDouble()
         var downX = 0f
         var downY = 0f
@@ -291,16 +326,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateOrbitCamera() {
-        val viewer = modelViewer ?: return
-        val cp = cos(orbitPitch)
-        val eyeX = orbitTarget.x + orbitRadius * cp * cos(orbitYaw)
-        val eyeY = orbitTarget.y + orbitRadius * cp * sin(orbitYaw)
-        val eyeZ = orbitTarget.z + orbitRadius * sin(orbitPitch)
-        viewer.camera.lookAt(
-            eyeX, eyeY, eyeZ,
-            orbitTarget.x.toDouble(), orbitTarget.y.toDouble(), orbitTarget.z.toDouble(),
-            0.0, 0.0, 1.0,
-        )
+        filamentScope.launch {
+            val viewer = modelViewer ?: return@launch
+            val cp = cos(orbitPitch)
+            val eyeX = orbitTarget.x + orbitRadius * cp * cos(orbitYaw)
+            val eyeY = orbitTarget.y + orbitRadius * cp * sin(orbitYaw)
+            val eyeZ = orbitTarget.z + orbitRadius * sin(orbitPitch)
+            viewer.camera.lookAt(
+                eyeX, eyeY, eyeZ,
+                orbitTarget.x.toDouble(), orbitTarget.y.toDouble(), orbitTarget.z.toDouble(),
+                0.0, 0.0, 1.0,
+            )
+        }
     }
 
     private fun resetOrbitCamera() {
@@ -330,6 +367,10 @@ class MainActivity : ComponentActivity() {
     private fun load3mf(uri: Uri) {
         // A result prepared for the previous file must never replace the newly selected model.
         modelBuildGeneration.incrementAndGet()
+        viewCache.clear()
+        GlbSceneBuilder.clearCache()
+        colorVersion = 0
+        prewarmLoadId++
         isLoading = true
         status = getString(R.string.status_loading)
         selectedIndex = null
@@ -339,8 +380,6 @@ class MainActivity : ComponentActivity() {
         thread(name = "3mf-loader") {
             runCatching {
                 val source = copyToCache(uri)
-                val explicitPlateIndices = ThreeMfBuildParser.explicitPlateIndices(source)
-                val usePlateLogic = explicitPlateIndices.size >= 2
                 val perfStart = System.currentTimeMillis()
                 val loaded = open3mf(source.absolutePath).use { document ->
                     Log.d("ThreeMfPerf", "Load 3MF: ${System.currentTimeMillis() - perfStart} ms")
@@ -400,13 +439,16 @@ class MainActivity : ComponentActivity() {
                     Log.d("ThreeMfPerf", "parseMesh: ${System.currentTimeMillis() - tMeshStart} ms")
                     val namesByObjectId = objects.associate { info -> info.resourceId to info.name }
                     val meshesByObjectId = rawMeshes.associate { (info, mesh) -> info.resourceId to mesh }
-                    val placedMeshes = ThreeMfBuildParser.placedMeshes(
+                    val parsed = ThreeMfBuildParser.parseProject(
                         file = source,
                         buildItems = buildItems,
                         componentsByObjectId = componentsByObjectId,
                         meshesByObjectId = meshesByObjectId,
                         namesByObjectId = namesByObjectId,
-                    ).ifEmpty {
+                    )
+                    val explicitPlateIndices = parsed.explicitPlateIndices
+                    val usePlateLogic = explicitPlateIndices.size >= 2
+                    val placedMeshes = parsed.placedMeshes.ifEmpty {
                         rawMeshes.map { (info, mesh) ->
                             PlacedMeshData(
                                 mesh = mesh,
@@ -449,6 +491,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         applyCurrentPreview()
                     }
+                    prewarmViews()
                     isLoading = false
                 }
             }.onFailure { error ->
@@ -480,29 +523,31 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun selectAt(x: Int, y: Int) {
-        val viewer = modelViewer ?: return
         val surface = filamentSurface ?: return
         if (meshes.isEmpty()) return
         val pickY = surface.height - y
-        viewer.view.pick(x, pickY, pickHandler) { result ->
-            val hit = entityToMeshIndex[result.renderable] ?: return@pick
-            val hitMesh = meshes.getOrNull(hit) ?: return@pick
-            val groupId = hitMesh.topLevelObjectId
-            if (groupId != null) {
-                val group = meshes.indices.filter { meshes[it].topLevelObjectId == groupId }.toSet()
-                if (hit in selectedIndices) {
-                    selectedIndex = null
-                    selectedIndices = emptySet()
+        filamentScope.launch {
+            val viewer = modelViewer ?: return@launch
+            viewer.view.pick(x, pickY, pickHandler) { result ->
+                val hit = entityToMeshIndex[result.renderable] ?: return@pick
+                val hitMesh = meshes.getOrNull(hit) ?: return@pick
+                val groupId = hitMesh.topLevelObjectId
+                if (groupId != null) {
+                    val group = meshes.indices.filter { meshes[it].topLevelObjectId == groupId }.toSet()
+                    if (hit in selectedIndices) {
+                        selectedIndex = null
+                        selectedIndices = emptySet()
+                    } else {
+                        selectedIndex = hit
+                        selectedIndices = group
+                    }
                 } else {
-                    selectedIndex = hit
-                    selectedIndices = group
+                    selectedIndex = if (hit == selectedIndex) null else hit
+                    selectedIndices = selectedIndex?.let { setOf(it) } ?: emptySet()
                 }
-            } else {
-                selectedIndex = if (hit == selectedIndex) null else hit
-                selectedIndices = selectedIndex?.let { setOf(it) } ?: emptySet()
+                applyMarkerVisibility()
+                updateAxisLabels()
             }
-            applyMarkerVisibility()
-            updateAxisLabels()
         }
     }
 
@@ -526,7 +571,16 @@ class MainActivity : ComponentActivity() {
             },
             replaceSceneMeshes = true,
             resetCamera = true,
+            cacheKey = currentViewCacheKey(),
         )
+    }
+
+    private fun currentViewCacheKey(): String? {
+        if (previewMode == PreviewMode.Plate) {
+            val plate = plates.getOrNull(selectedPlateIndex) ?: return null
+            return "plate:${plate.index}:$colorVersion"
+        }
+        return "all:$colorVersion"
     }
 
     private fun List<PlacedMeshData>.toSceneMeshes(): List<SceneMesh> {
@@ -590,6 +644,7 @@ class MainActivity : ComponentActivity() {
             sceneMeshes = { currentMeshes },
             replaceSceneMeshes = false,
             resetCamera = false,
+            cacheKey = currentViewCacheKey(),
         )
     }
 
@@ -597,10 +652,20 @@ class MainActivity : ComponentActivity() {
         sceneMeshes: () -> List<SceneMesh>,
         replaceSceneMeshes: Boolean,
         resetCamera: Boolean,
+        cacheKey: String? = null,
     ) {
         val requestId = modelBuildGeneration.incrementAndGet()
         val colorOverrides = modelColorController.overrideSnapshot()
         val requestedAt = System.currentTimeMillis()
+
+        if (cacheKey != null) {
+            val cached = viewCache[cacheKey]
+            if (cached != null) {
+                applyPreparedModelState(cached, replaceSceneMeshes, resetCamera, requestedAt, fromCache = true)
+                return
+            }
+        }
+
         modelBuildExecutor.execute modelBuild@{
             if (requestId != modelBuildGeneration.get()) return@modelBuild
             val prepared = runCatching {
@@ -621,12 +686,8 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 if (requestId != modelBuildGeneration.get() || isDestroyed) return@runOnUiThread
                 prepared.onSuccess { model ->
-                    if (replaceSceneMeshes) meshes = model.meshes
-                    modelColorController.replaceAvailableSlots(model.meshes)
-                    refreshEditableColors()
-                    if (resetCamera) resetOrbitCamera()
-                    applyPreparedModel(model, requestedAt)
-                    updateStatus()
+                    if (cacheKey != null) viewCache[cacheKey] = model
+                    applyPreparedModelState(model, replaceSceneMeshes, resetCamera, requestedAt, fromCache = false)
                 }.onFailure { error ->
                     Log.e("ThreeMfPerf", "GLB preparation failed", error)
                     Toast.makeText(
@@ -639,21 +700,85 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun applyPreparedModelState(
+        model: PreparedModel,
+        replaceSceneMeshes: Boolean,
+        resetCamera: Boolean,
+        requestedAt: Long,
+        fromCache: Boolean,
+    ) {
+        if (replaceSceneMeshes) meshes = model.meshes
+        modelColorController.replaceAvailableSlots(model.meshes)
+        refreshEditableColors()
+        if (resetCamera) resetOrbitCamera()
+        applyPreparedModel(model, requestedAt)
+        updateStatus()
+        if (fromCache) {
+            Log.d("ThreeMfPerf", "view cache hit: ${model.meshes.size} meshes")
+        }
+    }
+
+    private fun prewarmViews() {
+        val platesSnapshot = plates
+        val placedSnapshot = loadedPlacedMeshes
+        val currentKey = currentViewCacheKey()
+        val keys = buildList {
+            val allKey = "all:$colorVersion"
+            if (allKey != currentKey) add(allKey)
+            platesSnapshot.forEach { plate ->
+                val key = "plate:${plate.index}:$colorVersion"
+                if (key != currentKey) add(key)
+            }
+        }.distinct()
+        val colorOverrides = modelColorController.overrideSnapshot()
+        val loadId = prewarmLoadId
+        val buildGeneration = modelBuildGeneration.get()
+        viewPrebuildExecutor.execute {
+            for (key in keys) {
+                if (viewCache.containsKey(key)) continue
+                if (modelBuildGeneration.get() != buildGeneration) break
+                val version = key.substringAfterLast(':').toIntOrNull() ?: break
+                if (version != colorVersion || loadId != prewarmLoadId) break
+                val placed = when {
+                    key.startsWith("plate:") -> {
+                        val plateIndex = key.removePrefix("plate:").substringBefore(':').toIntOrNull()
+                        platesSnapshot.firstOrNull { it.index == plateIndex }?.meshes.orEmpty()
+                    }
+                    else -> placedSnapshot.arrangedForAllPreview(platesSnapshot)
+                }
+                if (placed.isEmpty()) continue
+                val sceneMeshes = runCatching { placed.toSceneMeshes() }.getOrNull() ?: continue
+                if (modelBuildGeneration.get() != buildGeneration) break
+                if (version != colorVersion || loadId != prewarmLoadId) break
+                val glb = runCatching { GlbSceneBuilder.build(sceneMeshes, null, colorOverrides) }.getOrNull() ?: continue
+                if (modelBuildGeneration.get() != buildGeneration) break
+                if (version != colorVersion || loadId != prewarmLoadId) break
+                viewCache[key] = PreparedModel(sceneMeshes, glb, 0L, 0L)
+            }
+        }
+    }
+
     private fun applyPreparedModel(model: PreparedModel, requestedAt: Long) {
-        val viewer = modelViewer ?: return
         val loadStart = System.currentTimeMillis()
-        viewer.destroyModel()
-        model.glb?.let { viewer.loadModelGlb(it) }
-        val loadDone = System.currentTimeMillis()
-        Log.d(
-            "ThreeMfPerf",
-            "createFilament: ${loadDone - requestedAt} ms " +
-                "(transform=${model.transformMs} ms, GLB=${model.buildMs} ms, load=${loadDone - loadStart} ms)",
-        )
-        updateOrbitCamera()
-        cacheSceneEntities()
-        applySceneVisibility()
-        updateAxisLabels()
+        val loadGeneration = modelBuildGeneration.get()
+        filamentScope.launch {
+            if (modelBuildGeneration.get() != loadGeneration) return@launch
+            val viewer = modelViewer ?: return@launch
+            viewer.destroyModel()
+            model.glb?.rewind()?.let { viewer.loadModelGlb(it) }
+            val loadDone = System.currentTimeMillis()
+            Log.d(
+                "ThreeMfPerf",
+                "createFilament: ${loadDone - requestedAt} ms " +
+                    "(transform=${model.transformMs} ms, GLB=${model.buildMs} ms, load=${loadDone - loadStart} ms)",
+            )
+            withContext(Dispatchers.Main) {
+                updateOrbitCamera()
+                cacheSceneEntities()
+                applySceneVisibility()
+                updateAxisLabels()
+            }
+        }
     }
 
     private fun configureFilamentView(viewer: ModelViewer) {
@@ -714,12 +839,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyBasePlateVisibility() {
-        setEntitiesVisible(basePlateEntities, showBasePlate)
+        filamentScope.launch {
+            setEntitiesVisible(basePlateEntities, showBasePlate)
+        }
     }
 
     private fun applyMarkerVisibility() {
-        markerEntities.forEachIndexed { index, entities ->
-            setMarkerEntitiesVisible(entities, index == selectedIndex)
+        filamentScope.launch {
+            markerEntities.forEachIndexed { index, entities ->
+                setMarkerEntitiesVisible(entities, index == selectedIndex)
+            }
         }
     }
 
@@ -735,41 +864,56 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateAxisLabels() {
-        val viewer = modelViewer ?: run { axisLabels = emptyList(); return }
-        val surface = filamentSurface ?: run { axisLabels = emptyList(); return }
-        val mesh = selectedIndex?.let { meshes.getOrNull(it) } ?: run { axisLabels = emptyList(); return }
-        if (surface.width == 0 || surface.height == 0) {
-            axisLabels = emptyList()
-            return
+        val currentSelectedIndex = selectedIndex
+        val currentMeshes = meshes
+        filamentScope.launch {
+            val viewer = modelViewer ?: run {
+                withContext(Dispatchers.Main) { axisLabels = emptyList() }
+                return@launch
+            }
+            val surface = filamentSurface ?: run {
+                withContext(Dispatchers.Main) { axisLabels = emptyList() }
+                return@launch
+            }
+            val mesh = currentSelectedIndex?.let { currentMeshes.getOrNull(it) }
+                ?: run {
+                    withContext(Dispatchers.Main) { axisLabels = emptyList() }
+                    return@launch
+                }
+            if (surface.width == 0 || surface.height == 0) {
+                withContext(Dispatchers.Main) { axisLabels = emptyList() }
+                return@launch
+            }
+            val bounds = mesh.renderBounds
+            val span = maxOf(bounds.size.x, bounds.size.y, bounds.size.z)
+            val pad = maxOf(0.03f, span * 0.08f)
+            val frontX = bounds.max.x
+            val frontY = bounds.min.y
+            val labels = listOfNotNull(
+                projectLabel(
+                    viewer,
+                    surface,
+                    "X",
+                    Vec3(bounds.center.x, frontY - pad, bounds.max.z + pad),
+                    Color(0xFFE11D48),
+                ),
+                projectLabel(
+                    viewer,
+                    surface,
+                    "Y",
+                    Vec3(frontX + pad, bounds.center.y, bounds.max.z + pad),
+                    Color(0xFF16A34A),
+                ),
+                projectLabel(
+                    viewer,
+                    surface,
+                    "Z",
+                    Vec3(frontX + pad, frontY - pad, bounds.center.z),
+                    Color(0xFF2563EB),
+                ),
+            )
+            withContext(Dispatchers.Main) { axisLabels = labels }
         }
-        val bounds = mesh.renderBounds
-        val span = maxOf(bounds.size.x, bounds.size.y, bounds.size.z)
-        val pad = maxOf(0.03f, span * 0.08f)
-        val frontX = bounds.max.x
-        val frontY = bounds.min.y
-        axisLabels = listOfNotNull(
-            projectLabel(
-                viewer,
-                surface,
-                "X",
-                Vec3(bounds.center.x, frontY - pad, bounds.max.z + pad),
-                Color(0xFFE11D48),
-            ),
-            projectLabel(
-                viewer,
-                surface,
-                "Y",
-                Vec3(frontX + pad, bounds.center.y, bounds.max.z + pad),
-                Color(0xFF16A34A),
-            ),
-            projectLabel(
-                viewer,
-                surface,
-                "Z",
-                Vec3(frontX + pad, frontY - pad, bounds.center.z),
-                Color(0xFF2563EB),
-            ),
-        )
     }
 
     private fun projectLabel(viewer: ModelViewer, surface: SurfaceView, text: String, point: Vec3, color: Color): AxisLabel? {

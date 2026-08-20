@@ -166,13 +166,16 @@ internal fun List<PlacedMeshData>.resolvePlatePreviews(
     declaredPlateIndices: List<Int> = emptyList(),
     plateName: (Int) -> String = { "Plate $it" },
 ): List<PlatePreview> {
-    if (isEmpty()) return declaredPlateIndices.distinct().sorted().map { PlatePreview(it, plateName(it), emptyList()) }
+    if (declaredPlateIndices.isEmpty()) return emptyList()
 
-    val explicitPlates = explicitPlatePreviews(declaredPlateIndices, plateName)
-    if (explicitPlates.size >= 2) return explicitPlates
-
-    val clusteredPlates = clusterPlatePreviews(plateName)
-    return clusteredPlates.takeIf { it.size >= 2 }.orEmpty()
+    val plateIndices = declaredPlateIndices.distinct().sorted()
+    return plateIndices.map { plate ->
+        PlatePreview(
+            index = plate,
+            name = plateName(plate),
+            meshes = filter { it.plateIndex == plate },
+        )
+    }
 }
 
 private fun List<PlatePreview>.debugSummary(): String =
@@ -185,7 +188,13 @@ private fun List<PlacedMeshData>.debugMapping(): String = joinToString(prefix = 
 fun List<PlacedMeshData>.arrangedForAllPreview(plates: List<PlatePreview>): List<PlacedMeshData> {
     if (isEmpty()) return this
     if (totalVertexFloats() > MAX_PLACED_COMPACT_FLOATS) return this
-    val groups = if (plates.size >= 2) plates.map { it.meshes }.filter { it.isNotEmpty() } else clusterSparseXyGroups()
+    val groups = if (plates.size >= 2) {
+        val plateGroups = plates.map { it.meshes }.filter { it.isNotEmpty() }
+        val unassigned = filter { it.plateIndex == null }
+        if (unassigned.isNotEmpty()) plateGroups + listOf(unassigned) else plateGroups
+    } else {
+        clusterSparseXyGroups()
+    }
     if (groups.size <= 1) return compactedForPreview()
 
     // Move whole plates only. Repacking individual meshes breaks component transforms.
@@ -219,56 +228,6 @@ fun List<PlacedMeshData>.arrangedForAllPreview(plates: List<PlatePreview>): List
     val recenter = Vec3(-arrangedBounds.center.x, -arrangedBounds.center.y, 0.0f)
     return arranged.map { it.translated(recenter) }
 }
-
-private fun List<PlacedMeshData>.explicitPlatePreviews(
-    declaredPlateIndices: List<Int>,
-    plateName: (Int) -> String,
-): List<PlatePreview> {
-    val explicit = (declaredPlateIndices + mapNotNull { it.plateIndex }).distinct().sorted()
-    if (explicit.isEmpty()) return emptyList()
-
-    val meshIndicesByPlate = explicit.associateWith { mutableListOf<Int>() }
-    forEachIndexed { meshIndex, mesh ->
-        mesh.plateIndex?.let(meshIndicesByPlate::get)?.add(meshIndex)
-    }
-    val assignedIndices = meshIndicesByPlate.values.flatten().toSet()
-    val unassignedIndices = indices.filterNot { it in assignedIndices }
-    if (unassignedIndices.isNotEmpty()) {
-        val bounds = map { it.placedBounds() }
-        unassignedIndices.forEach { meshIndex ->
-            meshIndicesByPlate.entries
-                .filter { it.value.isNotEmpty() }
-                .minByOrNull { (_, plateMeshIndices) ->
-                    plateMeshIndices.minOf { plateMeshIndex ->
-                        bounds[meshIndex].xyDistanceSquaredTo(bounds[plateMeshIndex])
-                    }
-                }
-                ?.value
-                ?.add(meshIndex)
-        }
-    }
-
-    if (meshIndicesByPlate.values.all { it.isEmpty() }) {
-        // Some slicers declare plates but omit instance mappings; keep every mesh visible.
-        clusterSparseXyGroups().forEachIndexed { clusterIndex, cluster ->
-            val plate = explicit[minOf(clusterIndex, explicit.lastIndex)]
-            cluster.forEach { mesh ->
-                indexOfFirst { it === mesh }.takeIf { it >= 0 }?.let(meshIndicesByPlate.getValue(plate)::add)
-            }
-        }
-    }
-
-    return explicit.map { plate ->
-        PlatePreview(plate, plateName(plate), meshIndicesByPlate.getValue(plate).map(::get))
-    }
-}
-
-private fun List<PlacedMeshData>.clusterPlatePreviews(plateName: (Int) -> String): List<PlatePreview> {
-    val clusters = clusterSparseXyGroups()
-    if (clusters.size <= 1) return emptyList()
-    return clusters.mapIndexed { index, meshes -> PlatePreview(index + 1, plateName(index + 1), meshes) }
-}
-
 
 /**
  * Bambu/Orca projects can contain source or multi-plate coordinates that are much wider
@@ -367,12 +326,6 @@ private fun Bounds.inflatedXyOverlaps(other: Bounds, amount: Float): Boolean =
     min.x - amount <= other.max.x && max.x + amount >= other.min.x &&
         min.y - amount <= other.max.y && max.y + amount >= other.min.y
 
-private fun Bounds.xyDistanceSquaredTo(other: Bounds): Float {
-    val dx = maxOf(0.0f, min.x - other.max.x, other.min.x - max.x)
-    val dy = maxOf(0.0f, min.y - other.max.y, other.min.y - max.y)
-    return dx * dx + dy * dy
-}
-
 private fun PlacedMeshData.translated(delta: Vec3): PlacedMeshData {
     if (delta.x == 0.0f && delta.y == 0.0f && delta.z == 0.0f) return this
     return copy(previewOffset = previewOffset + delta)
@@ -427,27 +380,34 @@ object ThreeMfBuildParser {
     private val PAINT_COLOR_BYTES = "paint_color".toByteArray()
 
     fun explicitPlateIndices(file: File): List<Int> = ZipFile(file).use { zip ->
-        buildSet {
-            val plateFile = Regex("(?:^|/)plate[_-]?(\\d+)\\.json$", RegexOption.IGNORE_CASE)
-            zip.entries().asSequence()
-                .mapNotNull { entry -> plateFile.find(entry.name)?.groupValues?.getOrNull(1)?.toIntOrNull() }
-                .forEach(::add)
-
-            addAll(readPlateConfig(zip).plateIndices)
-
-            val modelEntry = zip.getEntry(STANDARD_MODEL_PATH)
-                ?: zip.entries().asSequence().firstOrNull {
-                    !it.isDirectory && it.name.endsWith(".model", ignoreCase = true)
-                }
-            val modelSize = modelEntry?.size?.takeIf { it >= 0L } ?: modelEntry?.compressedSize ?: -1L
-            if (modelEntry != null && modelSize in 0L..MAX_MODEL_XML_PLATE_SCAN_BYTES) {
-                parseModelFromZip(zip)?.buildItems?.mapNotNullTo(this) { it.plateIndex }
-            }
-        }
-            .sorted()
+        resolveExplicitPlateIndices(readProjectMetadata(zip))
     }
 
     fun hasExplicitMultiplePlates(file: File): Boolean = explicitPlateIndices(file).size >= 2
+
+    fun parseProject(
+        file: File,
+        buildItems: List<BuildItemInfo>,
+        componentsByObjectId: Map<Int, List<ComponentInfo>>,
+        meshesByObjectId: Map<Int, MeshData>,
+        namesByObjectId: Map<Int, String>,
+    ): ParsedProject {
+        materialLayoutTotalMs = 0
+        return ZipFile(file).use { zip ->
+            val metadata = readProjectMetadata(zip)
+            val explicit = resolveExplicitPlateIndices(metadata)
+            if (buildItems.isEmpty()) return@use ParsedProject(explicit, emptyList())
+            val placed = placedMeshesInternal(
+                zip = zip,
+                metadata = metadata,
+                buildItems = buildItems,
+                componentsByObjectId = componentsByObjectId,
+                meshesByObjectId = meshesByObjectId,
+                namesByObjectId = namesByObjectId,
+            )
+            ParsedProject(explicit, placed)
+        }
+    }
 
     fun placedMeshes(
         file: File,
@@ -455,112 +415,146 @@ object ThreeMfBuildParser {
         componentsByObjectId: Map<Int, List<ComponentInfo>>,
         meshesByObjectId: Map<Int, MeshData>,
         namesByObjectId: Map<Int, String>,
-    ): List<PlacedMeshData> {
-        materialLayoutTotalMs = 0
-        if (buildItems.isEmpty()) return emptyList()
+    ): List<PlacedMeshData> =
+        parseProject(file, buildItems, componentsByObjectId, meshesByObjectId, namesByObjectId).placedMeshes
 
-        ZipFile(file).use { zip ->
-            // ==================== Phase 1: Parse Hierarchy ====================
-            val tPhase1 = System.currentTimeMillis()
-
-            val volumeConfigs = readVolumeConfigs(zip)
-            val scene = parseModelFromZip(zip)
-            val xmlBuildItems = scene?.buildItems.orEmpty()
-            val xmlObjectIds = xmlBuildItems.map { it.objectId }.toSet()
-            val jsonPlateByObjectId = readJsonPlateObjectIds(zip, xmlObjectIds)
-            val plateConfig = readPlateConfig(zip)
-            val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, plateConfig.assignments)
-
-            val objectCount = scene?.objectsById?.size ?: 0
-            val componentCount = scene?.objectsById?.values?.sumOf { it.components.size } ?: 0
-            logArchiveMetadata(zip)
-            logModelHierarchy(buildItems, componentsByObjectId, meshesByObjectId, namesByObjectId)
-
-            val tHierarchy = System.currentTimeMillis() - tPhase1
-            Log.d("ThreeMfPerf", "parseHierarchy: $tHierarchy ms (objects=$objectCount, components=$componentCount)")
-
-            // ==================== Phase 2: Parse Materials ====================
-            val tPhase2 = System.currentTimeMillis()
-
-            val filamentPalette = readFilamentPalette(zip)
-            val slicerMaterialsByObjectId = readSlicerMaterials(zip, filamentPalette)
-
-            val slicerPartResourceIds = slicerMaterialsByObjectId.values
-                .flatMap { it.parts }
-                .mapNotNull { it.modelResourceId }
-                .toSet()
-            val meshResourceIds = meshesByObjectId.values.map { it.modelResourceId }.toSet()
-            val paintNeededIds = meshResourceIds.filter { mid ->
-                mid !in slicerPartResourceIds && meshesByObjectId.values.any {
-                    it.modelResourceId == mid && it.propertyData.triangleResourceIds.all { rid -> rid == 0 }
-                }
-            }.toSet()
-
-            val paintColorsByResource = readPaintColors(zip, paintNeededIds)
-            paintColorsByResource.forEach { (resourceId, paintColors) ->
-                val digitCounts = paintColors.groupBy { it }.mapValues { it.value.size }
-                Log.d(THREE_MF_LOG_TAG, "Bambu paint_colors: resourceId=$resourceId, triangleCount=${paintColors.size}, digits=$digitCounts")
-            }
-
-            val tMaterial = System.currentTimeMillis() - tPhase2
-            Log.d("ThreeMfPerf", "parseMaterial: $tMaterial ms (paint_needed=${paintNeededIds.size}, paint_parsed=${paintColorsByResource.size})")
-
-            // ==================== Phase 3: Flatten & Apply ====================
-            val tPhase3 = System.currentTimeMillis()
-
-            Log.d(THREE_MF_LOG_TAG, "BuildItem count=${buildItems.size} (lib3mf), ${xmlBuildItems.size} (XML)")
-            buildItems.forEachIndexed { index, item ->
-                val xmlItem = xmlBuildItems.getOrNull(index)
-                Log.d(
-                    THREE_MF_LOG_TAG,
-                    "BuildItem[$index]: uniqueObjectId=${item.objectResourceId}, xmlObjectId=${xmlItem?.objectId}, " +
-                        "type=${item.objectResourceKind}, transform=${MeshTransform.fromLib3mf(item.transform).debugString()}, " +
-                        "xmlPlate=${xmlItem?.plateIndex}, configPlate=${configPlateByBuildIndex[index]}, " +
-                        "jsonPlate=${xmlItem?.objectId?.let(jsonPlateByObjectId::get)}",
-                )
-            }
-            scene?.objectsById?.values?.forEach { objectInfo ->
-                Log.d(THREE_MF_LOG_TAG, "XML object: localId=${objectInfo.id}, type=${objectInfo.type}, componentCount=${objectInfo.components.size}")
-                objectInfo.components.forEachIndexed { index, component ->
-                    Log.d(THREE_MF_LOG_TAG, "  XML Component[$index]: parentLocalId=${objectInfo.id}, objectLocalId=${component.objectId}, transform=${component.transform.debugString()}")
-                }
-            }
-
-            val placed = buildItems.flatMapIndexed { index, item ->
-                val xmlItem = xmlBuildItems.getOrNull(index)
-                val plateIndex = xmlItem?.plateIndex
-                    ?: configPlateByBuildIndex[index]
-                    ?: xmlItem?.objectId?.let(jsonPlateByObjectId::get)
-                val slicerMaterial = xmlItem?.objectId?.let(slicerMaterialsByObjectId::get)
-                flattenObject(
-                    objectId = item.objectResourceId,
-                    objectKind = item.objectResourceKind,
-                    topLevelObjectId = item.objectResourceId,
-                    buildItemIndex = index,
-                    plateIndex = plateIndex,
-                    slicerMaterial = slicerMaterial,
-                    transform = MeshTransform.fromLib3mf(item.transform),
-                    objectPath = listOf(item.objectResourceId),
-                    componentsByObjectId = componentsByObjectId,
-                    meshesByObjectId = meshesByObjectId,
-                    namesByObjectId = namesByObjectId,
-                    volumeConfigsByObjectId = volumeConfigs,
-                    activeStack = linkedSetOf(),
-                    paintColorsByResource = paintColorsByResource,
-                    filamentPalette = filamentPalette,
-                )
-            }
-
-            val named = placed.withUniqueNames()
-            named.groupBy { it.plateIndex }.toSortedMap(compareBy(nullsLast()) { it }).forEach { (plate, meshes) ->
-                Log.d(THREE_MF_LOG_TAG, "Parsed plate ${plate ?: "unassigned"} -> ${meshes.debugMapping()}")
-            }
-
-            val tFlatten = System.currentTimeMillis() - tPhase3
-            Log.d("ThreeMfPerf", "flattenApply: $tFlatten ms")
-            Log.d("ThreeMfPerf", "Split material: $materialLayoutTotalMs ms")
-            return named
+    private fun resolveExplicitPlateIndices(metadata: ProjectMetadata): List<Int> {
+        metadata.plateConfig.plates.takeIf { it.isNotEmpty() }?.let { plates ->
+            return plates.map { it.index }.distinct().sorted()
         }
+        metadata.jsonPlateByObjectId.values.distinct().sorted().takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
+        metadata.scene?.buildItems.orEmpty()
+            .mapNotNull { it.plateIndex }
+            .distinct()
+            .sorted()
+            .takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        return emptyList()
+    }
+
+    private fun readProjectMetadata(zip: ZipFile): ProjectMetadata {
+        val scene = parseModelFromZip(zip)
+        val plateConfig = readPlateConfig(zip)
+        // model_settings.config is the authoritative source. JSON plate files are only
+        // consulted when no config exists, so stale plate_*.json cannot inflate plate count.
+        val jsonPlateByObjectId = if (plateConfig.plates.isEmpty()) {
+            val xmlObjectIds = scene?.buildItems.orEmpty().map { it.objectId }.toSet()
+            readJsonPlateObjectIds(zip, xmlObjectIds)
+        } else {
+            emptyMap()
+        }
+        return ProjectMetadata(scene, plateConfig, jsonPlateByObjectId)
+    }
+
+    private fun placedMeshesInternal(
+        zip: ZipFile,
+        metadata: ProjectMetadata,
+        buildItems: List<BuildItemInfo>,
+        componentsByObjectId: Map<Int, List<ComponentInfo>>,
+        meshesByObjectId: Map<Int, MeshData>,
+        namesByObjectId: Map<Int, String>,
+    ): List<PlacedMeshData> {
+        val scene = metadata.scene
+        val xmlBuildItems = scene?.buildItems.orEmpty()
+        val jsonPlateByObjectId = metadata.jsonPlateByObjectId
+        val plateConfig = metadata.plateConfig
+        val configPlateByBuildIndex = matchConfigPlatesToBuildItems(xmlBuildItems, plateConfig)
+
+        // ==================== Phase 1: Parse Hierarchy ====================
+        val tPhase1 = System.currentTimeMillis()
+
+        val volumeConfigs = readVolumeConfigs(zip)
+        val objectCount = scene?.objectsById?.size ?: 0
+        val componentCount = scene?.objectsById?.values?.sumOf { it.components.size } ?: 0
+        logArchiveMetadata(zip)
+        logModelHierarchy(buildItems, componentsByObjectId, meshesByObjectId, namesByObjectId)
+
+        val tHierarchy = System.currentTimeMillis() - tPhase1
+        Log.d("ThreeMfPerf", "parseHierarchy: $tHierarchy ms (objects=$objectCount, components=$componentCount)")
+
+        // ==================== Phase 2: Parse Materials ====================
+        val tPhase2 = System.currentTimeMillis()
+
+        val filamentPalette = readFilamentPalette(zip)
+        val slicerMaterialsByObjectId = readSlicerMaterials(zip, filamentPalette)
+
+        val slicerPartResourceIds = slicerMaterialsByObjectId.values
+            .flatMap { it.parts }
+            .mapNotNull { it.modelResourceId }
+            .toSet()
+        val meshResourceIds = meshesByObjectId.values.map { it.modelResourceId }.toSet()
+        val paintNeededIds = meshResourceIds.filter { mid ->
+            mid !in slicerPartResourceIds && meshesByObjectId.values.any {
+                it.modelResourceId == mid && it.propertyData.triangleResourceIds.all { rid -> rid == 0 }
+            }
+        }.toSet()
+
+        val paintColorsByResource = readPaintColors(zip, paintNeededIds)
+        paintColorsByResource.forEach { (resourceId, paintColors) ->
+            val digitCounts = paintColors.groupBy { it }.mapValues { it.value.size }
+            Log.d(THREE_MF_LOG_TAG, "Bambu paint_colors: resourceId=$resourceId, triangleCount=${paintColors.size}, digits=$digitCounts")
+        }
+
+        val tMaterial = System.currentTimeMillis() - tPhase2
+        Log.d("ThreeMfPerf", "parseMaterial: $tMaterial ms (paint_needed=${paintNeededIds.size}, paint_parsed=${paintColorsByResource.size})")
+
+        // ==================== Phase 3: Flatten & Apply ====================
+        val tPhase3 = System.currentTimeMillis()
+
+        Log.d(THREE_MF_LOG_TAG, "BuildItem count=${buildItems.size} (lib3mf), ${xmlBuildItems.size} (XML)")
+        buildItems.forEachIndexed { index, item ->
+            val xmlItem = xmlBuildItems.getOrNull(index)
+            Log.d(
+                THREE_MF_LOG_TAG,
+                "BuildItem[$index]: uniqueObjectId=${item.objectResourceId}, xmlObjectId=${xmlItem?.objectId}, " +
+                    "type=${item.objectResourceKind}, transform=${MeshTransform.fromLib3mf(item.transform).debugString()}, " +
+                    "xmlPlate=${xmlItem?.plateIndex}, configPlate=${configPlateByBuildIndex[index]}, " +
+                    "jsonPlate=${xmlItem?.objectId?.let(jsonPlateByObjectId::get)}",
+            )
+        }
+        scene?.objectsById?.values?.forEach { objectInfo ->
+            Log.d(THREE_MF_LOG_TAG, "XML object: localId=${objectInfo.id}, type=${objectInfo.type}, componentCount=${objectInfo.components.size}")
+            objectInfo.components.forEachIndexed { index, component ->
+                Log.d(THREE_MF_LOG_TAG, "  XML Component[$index]: parentLocalId=${objectInfo.id}, objectLocalId=${component.objectId}, transform=${component.transform.debugString()}")
+            }
+        }
+
+        val placed = buildItems.flatMapIndexed { index, item ->
+            val xmlItem = xmlBuildItems.getOrNull(index)
+            val plateIndex = xmlItem?.plateIndex
+                ?: configPlateByBuildIndex[index]
+                ?: xmlItem?.objectId?.let(jsonPlateByObjectId::get)
+            val slicerMaterial = xmlItem?.objectId?.let(slicerMaterialsByObjectId::get)
+            flattenObject(
+                objectId = item.objectResourceId,
+                objectKind = item.objectResourceKind,
+                topLevelObjectId = item.objectResourceId,
+                buildItemIndex = index,
+                plateIndex = plateIndex,
+                slicerMaterial = slicerMaterial,
+                transform = MeshTransform.fromLib3mf(item.transform),
+                objectPath = listOf(item.objectResourceId),
+                componentsByObjectId = componentsByObjectId,
+                meshesByObjectId = meshesByObjectId,
+                namesByObjectId = namesByObjectId,
+                volumeConfigsByObjectId = volumeConfigs,
+                activeStack = linkedSetOf(),
+                paintColorsByResource = paintColorsByResource,
+                filamentPalette = filamentPalette,
+            )
+        }
+
+        val named = placed.withUniqueNames()
+        named.groupBy { it.plateIndex }.toSortedMap(compareBy(nullsLast()) { it }).forEach { (plate, meshes) ->
+            Log.d(THREE_MF_LOG_TAG, "Parsed plate ${plate ?: "unassigned"} -> ${meshes.debugMapping()}")
+        }
+
+        val tFlatten = System.currentTimeMillis() - tPhase3
+        Log.d("ThreeMfPerf", "flattenApply: $tFlatten ms")
+        Log.d("ThreeMfPerf", "Split material: $materialLayoutTotalMs ms")
+        return named
     }
 
     private fun logArchiveMetadata(zip: ZipFile) {
@@ -1437,32 +1431,48 @@ object ThreeMfBuildParser {
     }
 
     private fun parsePlateConfig(input: java.io.InputStream): PlateConfig {
-        val plateIndices = linkedSetOf<Int>()
-        val assignments = mutableListOf<PlateInstanceAssignment>()
-        var currentPlateId: Int? = null
+        val plates = mutableListOf<PlateInfo>()
+        var currentPlateIndex: Int? = null
+        var currentPlateName: String? = null
+        var currentPlateLocked = false
+        val currentInstances = mutableListOf<PlateModelInstance>()
         var inModelInstance = false
         var currentObjectId: Int? = null
         var currentInstanceId: Int? = null
+        var currentIdentifyId: Int? = null
 
         val handler = object : DefaultHandler() {
             override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes) {
                 val name = elementName(localName, qName)
                 when (name) {
-                    "plate" -> currentPlateId = null
+                    "plate" -> {
+                        // model_settings.config may omit plater_id; fall back to document order.
+                        currentPlateIndex = plates.size + 1
+                        currentPlateName = null
+                        currentPlateLocked = false
+                        currentInstances.clear()
+                    }
                     "model_instance" -> {
                         inModelInstance = true
                         currentObjectId = null
                         currentInstanceId = null
+                        currentIdentifyId = null
                     }
                     "metadata" -> {
                         val key = attributes.stringValue("key").trim().lowercase(Locale.US)
                         val value = attributes.stringValue("value").trim()
-                        if (inModelInstance && key == "object_id") {
-                            currentObjectId = value.toIntOrNull()
-                        } else if (inModelInstance && key == "instance_id") {
-                            currentInstanceId = value.toIntOrNull()
-                        } else if (!inModelInstance && key == "plater_id") {
-                            currentPlateId = value.toIntOrNull()?.also(plateIndices::add)
+                        if (inModelInstance) {
+                            when (key) {
+                                "object_id" -> currentObjectId = value.toIntOrNull()
+                                "instance_id" -> currentInstanceId = value.toIntOrNull()
+                                "identify_id" -> currentIdentifyId = value.toIntOrNull()
+                            }
+                        } else {
+                            when (key) {
+                                "plater_id" -> currentPlateIndex = value.toIntOrNull() ?: currentPlateIndex
+                                "plater_name", "plate_name", "name" -> currentPlateName = value.takeIf { it.isNotBlank() }
+                                "locked" -> currentPlateLocked = value.equals("true", ignoreCase = true)
+                            }
                         }
                     }
                 }
@@ -1472,38 +1482,43 @@ object ThreeMfBuildParser {
                 val name = elementName(localName, qName)
                 when (name) {
                     "model_instance" -> {
-                        val plate = currentPlateId
-                        val objectId = currentObjectId
-                        if (plate != null && objectId != null) {
-                            assignments += PlateInstanceAssignment(plate, objectId, currentInstanceId)
+                        currentObjectId?.let { objectId ->
+                            currentInstances += PlateModelInstance(objectId, currentInstanceId, currentIdentifyId)
                         }
                         inModelInstance = false
                     }
-                    "plate" -> currentPlateId = null
+                    "plate" -> {
+                        val index = currentPlateIndex ?: (plates.size + 1)
+                        plates += PlateInfo(index, currentPlateName, currentPlateLocked, currentInstances.toList())
+                        currentPlateIndex = null
+                        currentInstances.clear()
+                    }
                 }
             }
         }
 
         saxParser.parse(input, handler)
-        return PlateConfig(plateIndices.toList(), assignments)
+        return PlateConfig(plates)
     }
 
     private fun matchConfigPlatesToBuildItems(
         buildItems: List<ThreeMfBuildItem>,
-        assignments: List<PlateInstanceAssignment>,
+        plateConfig: PlateConfig,
     ): Map<Int, Int> {
-        val assignmentsByObject = assignments.groupBy { it.objectId }
+        val assignmentsByObject = plateConfig.assignments.groupBy { it.second.objectId }
         val nextInstanceByObject = mutableMapOf<Int, Int>()
         return buildMap {
             buildItems.forEachIndexed { buildIndex, item ->
                 val instanceIndex = nextInstanceByObject.getOrDefault(item.objectId, 0)
                 nextInstanceByObject[item.objectId] = instanceIndex + 1
                 val candidates = assignmentsByObject[item.objectId].orEmpty()
-                val assignment = candidates.firstOrNull { it.instanceId == instanceIndex }
-                    ?: candidates.singleOrNull()
-                    ?: candidates.firstOrNull { it.instanceId == null }
+                // instance_id is the reliable key. identify_id is parsed but not used as a
+                // heuristic fallback because it has no safe build-item mapping without the
+                // production-extension UUID context.
+                val assignment = candidates.firstOrNull { it.second.instanceId == instanceIndex }
+                    ?: candidates.singleOrNull { it.second.instanceId == null }
                 if (assignment != null) {
-                    put(buildIndex, assignment.plateIndex)
+                    put(buildIndex, assignment.first)
                 } else {
                     Log.w(
                         THREE_MF_LOG_TAG,
@@ -1578,17 +1593,44 @@ private data class ThreeMfObject(
 private data class ThreeMfComponent(val objectId: Int, val transform: MeshTransform)
 private data class ThreeMfBuildItem(val objectId: Int, val transform: MeshTransform, val plateIndex: Int?)
 private data class PendingBuildItem(val objectId: Int, val transform: MeshTransform, var plateIndex: Int?)
-private data class PlateInstanceAssignment(val plateIndex: Int, val objectId: Int, val instanceId: Int?)
+private data class PlateModelInstance(
+    val objectId: Int,
+    val instanceId: Int?,
+    val identifyId: Int? = null,
+)
+
+private data class PlateInfo(
+    val index: Int,
+    val name: String? = null,
+    val locked: Boolean = false,
+    val instances: List<PlateModelInstance> = emptyList(),
+)
+
 private data class PlateConfig(
-    val plateIndices: List<Int>,
-    val assignments: List<PlateInstanceAssignment>,
+    val plates: List<PlateInfo>,
 ) {
+    val plateIndices: List<Int>
+        get() = plates.map { it.index }.distinct().sorted()
+
+    val assignments: List<Pair<Int, PlateModelInstance>>
+        get() = plates.flatMap { plate -> plate.instances.map { plate.index to it } }
+
     companion object {
-        val EMPTY = PlateConfig(emptyList(), emptyList())
+        val EMPTY = PlateConfig(emptyList())
     }
 }
 
-private const val MAX_MODEL_XML_PLATE_SCAN_BYTES = 16L * 1024L * 1024L
+private data class ProjectMetadata(
+    val scene: ThreeMfScene?,
+    val plateConfig: PlateConfig,
+    val jsonPlateByObjectId: Map<Int, Int>,
+)
+
+data class ParsedProject(
+    val explicitPlateIndices: List<Int>,
+    val placedMeshes: List<PlacedMeshData>,
+)
+
 private const val MAX_PLACED_COMPACT_FLOATS = 3_000_000L
 private const val MAX_VOLUME_SPLIT_FLOATS = 3_000_000L
 private const val MAX_VOLUME_SPLIT_INDICES = 3_000_000L

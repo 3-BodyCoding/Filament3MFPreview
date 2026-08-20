@@ -2,6 +2,8 @@ package com.filament.preview
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.Locale
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -14,6 +16,16 @@ object GlbSceneBuilder {
     fun meshNodeName(index: Int): String = "mesh_$index"
     fun markerNodeName(index: Int): String = "marker_$index"
 
+    private val shadingCache = Collections.synchronizedMap(IdentityHashMap<SceneMesh, MeshShading>())
+    private const val MAX_SHADING_CACHE_SIZE = 128
+
+    fun clearCache() {
+        synchronized(shadingCache) {
+            shadingCache.clear()
+        }
+    }
+
+    @Synchronized
     fun build(
         meshes: List<SceneMesh>,
         overrideColor: FloatArray?,
@@ -37,9 +49,16 @@ object GlbSceneBuilder {
         }
 
         val meshDefinitions = mutableListOf<MeshDefinition>()
+        val useCreaseAware = meshes.sumOf { it.indices.size / 3 } <= MAX_CREASE_AWARE_TOTAL_TRIANGLES
         meshes.forEachIndexed { index, mesh ->
             // Build smoothing groups on the complete surface before splitting it by material.
-            val shading = MeshShading(mesh.vertices, mesh.indices, MODEL_CREASE_ANGLE_DEGREES)
+            // SceneMesh instances are reused for color-only rebuilds, so cache the expensive
+            // crease-aware normal computation by object identity.
+            val shading = synchronized(shadingCache) {
+                if (shadingCache.size >= MAX_SHADING_CACHE_SIZE) shadingCache.clear()
+                shadingCache[mesh] ?: MeshShading(mesh.vertices, mesh.indices, MODEL_CREASE_ANGLE_DEGREES, useCreaseAware)
+                    .also { shadingCache[mesh] = it }
+            }
             val layout = mesh.materialLayout
             val primitives = if (layout == null || layout.primitives.isEmpty()) {
                 modelColors += overrideColor ?: mesh.displayColor ?: DEFAULT_MODEL_COLOR
@@ -423,18 +442,36 @@ private class MeshShading(
     private val sourceVertices: FloatArray,
     private val sourceIndices: IntArray,
     creaseAngleDegrees: Float,
+    creaseAware: Boolean,
 ) {
-    private val cornerNormals = computeCreaseAwareCornerNormals(sourceVertices, sourceIndices, creaseAngleDegrees)
-    private val fallbackNormals = computeVertexNormals(sourceVertices, sourceIndices)
-    private val triangleOffsets = linkedMapOf<TriangleKey, MutableList<Int>>()
-    private val nextTriangleByKey = mutableMapOf<TriangleKey, Int>()
+    private val cornerNormals: FloatArray
+    private val fallbackNormals: FloatArray
+    private val triangleOffsets: Map<TriangleKey, MutableList<Int>>
+    private val nextTriangleByKey: MutableMap<TriangleKey, Int>
 
     init {
-        var offset = 0
-        while (offset + 2 < sourceIndices.size) {
-            val key = TriangleKey(sourceIndices[offset], sourceIndices[offset + 1], sourceIndices[offset + 2])
-            triangleOffsets.getOrPut(key) { mutableListOf() }.add(offset)
-            offset += 3
+        val triangleCount = sourceIndices.size / 3
+        val useCreaseAwareNormals = creaseAware && triangleCount <= MAX_CREASE_AWARE_TRIANGLES
+        cornerNormals = if (useCreaseAwareNormals) {
+            computeCreaseAwareCornerNormals(sourceVertices, sourceIndices, creaseAngleDegrees)
+        } else {
+            // Avoid OOM on very large meshes: crease-aware normals need a large edge map.
+            // Falling back to per-vertex normals keeps the preview usable with much less memory.
+            FloatArray(0)
+        }
+        fallbackNormals = computeVertexNormals(sourceVertices, sourceIndices)
+        if (useCreaseAwareNormals) {
+            triangleOffsets = linkedMapOf()
+            nextTriangleByKey = mutableMapOf()
+            var offset = 0
+            while (offset + 2 < sourceIndices.size) {
+                val key = TriangleKey(sourceIndices[offset], sourceIndices[offset + 1], sourceIndices[offset + 2])
+                triangleOffsets.getOrPut(key) { mutableListOf() }.add(offset)
+                offset += 3
+            }
+        } else {
+            triangleOffsets = emptyMap()
+            nextTriangleByKey = mutableMapOf()
         }
     }
 
@@ -489,6 +526,7 @@ private class MeshShading(
 
     private fun resolveTriangleOffsets(indices: IntArray): IntArray {
         val resolved = IntArray((indices.size + 2) / 3) { -1 }
+        if (triangleOffsets.isEmpty()) return resolved
         var offset = 0
         while (offset + 2 < indices.size) {
             val key = TriangleKey(indices[offset], indices[offset + 1], indices[offset + 2])
@@ -772,4 +810,6 @@ private fun accumulateCornerNormal(
     normals[corner + 2] += faceZ * angle
 }
 
+private const val MAX_CREASE_AWARE_TRIANGLES = 120_000
+private const val MAX_CREASE_AWARE_TOTAL_TRIANGLES = 200_000
 private const val NORMAL_EPSILON = 1e-12f
