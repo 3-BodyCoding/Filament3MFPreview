@@ -49,14 +49,14 @@ object GlbSceneBuilder {
         }
 
         val meshDefinitions = mutableListOf<MeshDefinition>()
-        val useCreaseAware = meshes.sumOf { it.indices.size / 3 } <= MAX_CREASE_AWARE_TOTAL_TRIANGLES
         meshes.forEachIndexed { index, mesh ->
             // Build smoothing groups on the complete surface before splitting it by material.
             // SceneMesh instances are reused for color-only rebuilds, so cache the expensive
-            // crease-aware normal computation by object identity.
+            // per-mesh normal computation by object identity. The decision is intentionally
+            // per mesh: one large model must not force every other model back to vertex normals.
             val shading = synchronized(shadingCache) {
                 if (shadingCache.size >= MAX_SHADING_CACHE_SIZE) shadingCache.clear()
-                shadingCache[mesh] ?: MeshShading(mesh.vertices, mesh.indices, MODEL_CREASE_ANGLE_DEGREES, useCreaseAware)
+                shadingCache[mesh] ?: MeshShading(mesh.vertices, mesh.indices)
                     .also { shadingCache[mesh] = it }
             }
             val layout = mesh.materialLayout
@@ -423,8 +423,8 @@ object GlbSceneBuilder {
 
     internal const val MODEL_METALLIC = 0.0f
     internal const val MODEL_ROUGHNESS = 0.38f
-    // Preserve the relatively shallow manufactured creases commonly found in sliced 3MF parts.
-    internal const val MODEL_CREASE_ANGLE_DEGREES = 30.0f
+    // Retained as the explicit/test fallback; runtime meshes use an automatically estimated angle.
+    internal const val MODEL_CREASE_ANGLE_DEGREES = 15.0f
 }
 
 internal fun FloatArray.srgbToLinearRgba(): FloatArray = copyOf().also { linear ->
@@ -441,19 +441,18 @@ internal fun FloatArray.srgbToLinearRgba(): FloatArray = copyOf().also { linear 
 private class MeshShading(
     private val sourceVertices: FloatArray,
     private val sourceIndices: IntArray,
-    creaseAngleDegrees: Float,
-    creaseAware: Boolean,
 ) {
     private val cornerNormals: FloatArray
     private val fallbackNormals: FloatArray
-    private val triangleOffsets: Map<TriangleKey, MutableList<Int>>
-    private val nextTriangleByKey: MutableMap<TriangleKey, Int>
+    private val triangleOffsets: Map<TriangleKey, Int>
 
     init {
         val triangleCount = sourceIndices.size / 3
-        val useCreaseAwareNormals = creaseAware && triangleCount <= MAX_CREASE_AWARE_TRIANGLES
+        val useCreaseAwareNormals = triangleCount <= MAX_CREASE_AWARE_TRIANGLES
         cornerNormals = if (useCreaseAwareNormals) {
-            computeCreaseAwareCornerNormals(sourceVertices, sourceIndices, creaseAngleDegrees)
+            // Derive the crease threshold from this mesh's dihedral-angle distribution.
+            // This avoids making a model-specific angle a global rendering assumption.
+            computeCreaseAwareCornerNormals(sourceVertices, sourceIndices, null)
         } else {
             // Avoid OOM on very large meshes: crease-aware normals need a large edge map.
             // Falling back to per-vertex normals keeps the preview usable with much less memory.
@@ -461,17 +460,19 @@ private class MeshShading(
         }
         fallbackNormals = computeVertexNormals(sourceVertices, sourceIndices)
         if (useCreaseAwareNormals) {
-            triangleOffsets = linkedMapOf()
-            nextTriangleByKey = mutableMapOf()
+            val offsets = linkedMapOf<TriangleKey, Int>()
             var offset = 0
             while (offset + 2 < sourceIndices.size) {
                 val key = TriangleKey(sourceIndices[offset], sourceIndices[offset + 1], sourceIndices[offset + 2])
-                triangleOffsets.getOrPut(key) { mutableListOf() }.add(offset)
+                // Valid 3MF meshes do not repeat the same oriented triangle. Keep the
+                // first offset defensively so material primitives can be resolved without
+                // mutable per-build cursor state.
+                offsets.putIfAbsent(key, offset)
                 offset += 3
             }
+            triangleOffsets = offsets
         } else {
             triangleOffsets = emptyMap()
-            nextTriangleByKey = mutableMapOf()
         }
     }
 
@@ -530,12 +531,7 @@ private class MeshShading(
         var offset = 0
         while (offset + 2 < indices.size) {
             val key = TriangleKey(indices[offset], indices[offset + 1], indices[offset + 2])
-            val candidates = triangleOffsets[key]
-            val next = nextTriangleByKey.getOrDefault(key, 0)
-            if (candidates != null && next < candidates.size) {
-                resolved[offset / 3] = candidates[next]
-                nextTriangleByKey[key] = next + 1
-            }
+            triangleOffsets[key]?.let { resolved[offset / 3] = it }
             offset += 3
         }
         return resolved
@@ -553,7 +549,7 @@ private class MeshShading(
 internal fun computeCreaseAwareCornerNormals(
     vertices: FloatArray,
     indices: IntArray,
-    creaseAngleDegrees: Float,
+    creaseAngleDegrees: Float? = null,
 ): FloatArray {
     val triangleCount = indices.size / 3
     val faceNormals = FloatArray(triangleCount * 3)
@@ -591,7 +587,10 @@ internal fun computeCreaseAwareCornerNormals(
     }
 
     val groups = DisjointSet(triangleCount * 3)
-    val creaseCosine = cos(Math.toRadians(creaseAngleDegrees.toDouble())).toFloat()
+    val effectiveCreaseAngle = creaseAngleDegrees
+        ?.takeIf { it.isFinite() && it > 0.0f }
+        ?: estimateCreaseAngleDegrees(edgeUses, faceNormals)
+    val creaseCosine = cos(Math.toRadians(effectiveCreaseAngle.toDouble())).toFloat()
     edgeUses.values.forEach { uses ->
         val second = uses.second ?: return@forEach
         if (!uses.isManifold) return@forEach
@@ -641,6 +640,64 @@ internal fun computeCreaseAwareCornerNormals(
         }
     }
     return result
+}
+
+/**
+ * Finds a mesh-local feature angle from the gaps in its manifold dihedral-angle distribution.
+ * Sliced meshes usually contain a dense cluster of shallow tessellation angles followed by a
+ * sparse cluster of intentional creases. If no reliable gap exists, retain a conservative
+ * fallback rather than making a model-wide assumption.
+ */
+private fun estimateCreaseAngleDegrees(
+    edgeUses: Map<Long, EdgePair>,
+    faceNormals: FloatArray,
+    minimum: Float = AUTO_CREASE_MIN_DEGREES,
+    maximum: Float = AUTO_CREASE_MAX_DEGREES,
+    fallback: Float = AUTO_CREASE_FALLBACK_DEGREES,
+): Float {
+    val angles = FloatArray(edgeUses.size)
+    var count = 0
+    edgeUses.values.forEach { uses ->
+        val second = uses.second ?: return@forEach
+        if (!uses.isManifold) return@forEach
+        val firstOffset = uses.first.triangle * 3
+        val secondOffset = second.triangle * 3
+        val ax = faceNormals[firstOffset]
+        val ay = faceNormals[firstOffset + 1]
+        val az = faceNormals[firstOffset + 2]
+        val bx = faceNormals[secondOffset]
+        val by = faceNormals[secondOffset + 1]
+        val bz = faceNormals[secondOffset + 2]
+        val crossX = ay * bz - az * by
+        val crossY = az * bx - ax * bz
+        val crossZ = ax * by - ay * bx
+        val crossLength = sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ)
+        val dot = (ax * bx + ay * by + az * bz).coerceIn(-1.0f, 1.0f)
+        val angle = Math.toDegrees(atan2(crossLength, dot).toDouble()).toFloat()
+        if (angle.isFinite()) angles[count++] = angle
+    }
+    if (count < MIN_AUTO_CREASE_SAMPLES) return fallback
+
+    val sorted = angles.copyOf(count).apply { sort() }
+    var bestGap = 0.0f
+    var bestThreshold = fallback
+    for (index in 0 until sorted.lastIndex) {
+        val lower = sorted[index]
+        val upper = sorted[index + 1]
+        if (lower < minimum || upper > maximum) continue
+        val gap = upper - lower
+        if (gap > bestGap) {
+            bestGap = gap
+            bestThreshold = (lower + upper) * 0.5f
+        }
+    }
+    return if (bestGap >= AUTO_CREASE_MIN_GAP_DEGREES) {
+        // Never relax beyond the proven-safe fallback. Automatic detection may only make
+        // smoothing stricter when the mesh provides strong evidence for a lower crease.
+        bestThreshold.coerceIn(minimum, minOf(maximum, fallback))
+    } else {
+        fallback.coerceIn(minimum, maximum)
+    }
 }
 
 private fun validVertexOffset(offset: Int, vertices: FloatArray): Boolean =
@@ -811,5 +868,11 @@ private fun accumulateCornerNormal(
 }
 
 private const val MAX_CREASE_AWARE_TRIANGLES = 120_000
-private const val MAX_CREASE_AWARE_TOTAL_TRIANGLES = 200_000
+// Keep automatic smoothing conservative. Larger feature angles are often intentional
+// concave/convex boundaries in printable meshes and should not be rejoined globally.
+private const val AUTO_CREASE_MIN_DEGREES = 10.0f
+private const val AUTO_CREASE_MAX_DEGREES = 20.0f
+private const val AUTO_CREASE_FALLBACK_DEGREES = 15.0f
+private const val AUTO_CREASE_MIN_GAP_DEGREES = 2.0f
+private const val MIN_AUTO_CREASE_SAMPLES = 32
 private const val NORMAL_EPSILON = 1e-12f

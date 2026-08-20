@@ -131,9 +131,9 @@ class GlbSceneBuilderTest {
     }
 
     @Test
-    fun `thirty degree crease policy preserves shallow manufactured edges`() {
+    fun `fifteen degree crease policy preserves shallow manufactured edges`() {
         val belowCrease = computeCreaseAwareCornerNormals(
-            bentSurfaceVertices(25.0),
+            bentSurfaceVertices(10.0),
             intArrayOf(0, 1, 2, 1, 0, 3),
             GlbSceneBuilder.MODEL_CREASE_ANGLE_DEGREES,
         )
@@ -145,6 +145,42 @@ class GlbSceneBuilderTest {
 
         assertTrue(dot(belowCrease, 0, belowCrease, 12) > 0.999f)
         assertTrue(dot(aboveCrease, 0, aboveCrease, 12) < 0.9f)
+    }
+
+    @Test
+    fun `automatic crease threshold separates smooth and hard edge populations`() {
+        val pairCount = 64
+        val vertices = FloatArray(pairCount * 4 * 3)
+        val indices = IntArray(pairCount * 6)
+        for (pair in 0 until pairCount) {
+            val vertexBase = pair * 4
+            val vertexOffset = vertexBase * 3
+            val angle = Math.toRadians(if (pair < pairCount / 2) 10.0 else 35.0)
+            vertices[vertexOffset] = 0.0f
+            vertices[vertexOffset + 1] = 0.0f
+            vertices[vertexOffset + 2] = 0.0f
+            vertices[vertexOffset + 3] = 1.0f
+            vertices[vertexOffset + 4] = 0.0f
+            vertices[vertexOffset + 5] = 0.0f
+            vertices[vertexOffset + 6] = 0.0f
+            vertices[vertexOffset + 7] = 1.0f
+            vertices[vertexOffset + 8] = 0.0f
+            vertices[vertexOffset + 9] = 0.0f
+            vertices[vertexOffset + 10] = -kotlin.math.cos(angle).toFloat()
+            vertices[vertexOffset + 11] = kotlin.math.sin(angle).toFloat()
+            val indexOffset = pair * 6
+            indices[indexOffset] = vertexBase
+            indices[indexOffset + 1] = vertexBase + 1
+            indices[indexOffset + 2] = vertexBase + 2
+            indices[indexOffset + 3] = vertexBase + 1
+            indices[indexOffset + 4] = vertexBase
+            indices[indexOffset + 5] = vertexBase + 3
+        }
+
+        val normals = computeCreaseAwareCornerNormals(vertices, indices)
+        val hardPairOffset = (pairCount / 2) * 2 * 9
+        assertTrue(dot(normals, 0, normals, 12) > 0.999f)
+        assertTrue(dot(normals, hardPairOffset, normals, hardPairOffset + 12) < 0.9f)
     }
 
     @Test
@@ -180,7 +216,7 @@ private fun smoothBentSurfaceVertices(): FloatArray = floatArrayOf(
     0.0f, 0.0f, 0.0f,
     1.0f, 0.0f, 0.0f,
     0.0f, 1.0f, 0.0f,
-    0.0f, -0.8660254f, 0.5f,
+    0.0f, -0.9848077f, 0.1736482f,
 )
 
 private fun hardBentSurfaceVertices(): FloatArray = floatArrayOf(
