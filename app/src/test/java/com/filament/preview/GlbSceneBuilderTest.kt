@@ -205,7 +205,7 @@ class GlbSceneBuilderTest {
 
         assertTrue(json.contains("\"NORMAL\":"))
         assertTrue(json.contains("\"metallicFactor\":0.0"))
-        assertTrue(json.contains("\"roughnessFactor\":0.38"))
+        assertTrue(json.contains("\"roughnessFactor\":0.28"))
         assertTrue(json.contains("\"baseColorFactor\":[0.214041, 0.214041, 0.214041, 1.000000]"))
         assertArrayEquals(floatArrayOf(0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f), vertices, 0.0f)
         assertArrayEquals(intArrayOf(0, 1, 2), indices)

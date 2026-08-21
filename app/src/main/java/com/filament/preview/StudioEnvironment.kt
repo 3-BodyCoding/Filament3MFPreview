@@ -27,9 +27,8 @@ class StudioEnvironment private constructor(
     }
 
     companion object {
-        // Keep enough angular detail for stable, continuous highlights after specular prefiltering.
-        private const val WIDTH = 256
-        private const val HEIGHT = 128
+        private const val WIDTH = 512
+        private const val HEIGHT = 256
 
         fun create(engine: Engine): StudioEnvironment {
             val radiance = buildStudioRadiance(WIDTH, HEIGHT)
@@ -61,7 +60,7 @@ class StudioEnvironment private constructor(
                 val indirectLight = IndirectLight.Builder()
                     .reflections(generatedReflections)
                     .irradiance(3, radiance.irradianceSh)
-                    .intensity(11_000f)
+                    .intensity(16_000f)
                     .build(engine)
                 val skybox = Skybox.Builder()
                     .color(0.10f, 0.12f, 0.15f, 1.0f)
@@ -132,13 +131,14 @@ class StudioEnvironment private constructor(
         private fun studioColor(direction: Direction): HdrColor {
             val horizon = (1.0f - direction.y * direction.y).coerceIn(0.0f, 1.0f)
             val floor = max(-direction.y, 0.0f)
-            val key = direction.lobe(Direction(-0.58f, 0.56f, 0.59f), 70.0f) * 3.0f
-            val fill = direction.lobe(Direction(0.78f, 0.28f, 0.56f), 48.0f) * 1.5f
-            val rim = direction.lobe(Direction(0.08f, 0.80f, -0.60f), 95.0f) * 2.0f
+            val key = direction.lobe(Direction(-0.58f, 0.56f, 0.59f), 110.0f) * 7.0f
+            val fill = direction.lobe(Direction(0.78f, 0.28f, 0.56f), 70.0f) * 2.2f
+            val rim = direction.lobe(Direction(0.08f, 0.80f, -0.60f), 130.0f) * 3.2f
+            val spot = direction.lobe(Direction(-0.30f, 0.92f, 0.20f), 360.0f) * 9.0f
             return HdrColor(
-                red = 0.055f + horizon * 0.045f + floor * 0.018f + key + fill * 0.72f + rim * 0.58f,
-                green = 0.065f + horizon * 0.052f + floor * 0.015f + key * 0.96f + fill * 0.82f + rim * 0.72f,
-                blue = 0.082f + horizon * 0.065f + floor * 0.012f + key * 0.90f + fill + rim,
+                red = 0.045f + horizon * 0.04f + floor * 0.015f + key + fill * 0.70f + rim * 0.55f + spot,
+                green = 0.055f + horizon * 0.045f + floor * 0.013f + key * 0.97f + fill * 0.80f + rim * 0.70f + spot * 0.98f,
+                blue = 0.075f + horizon * 0.055f + floor * 0.010f + key * 0.92f + fill * 0.98f + rim * 0.98f + spot * 0.95f,
             )
         }
 

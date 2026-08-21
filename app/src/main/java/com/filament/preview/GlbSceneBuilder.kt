@@ -13,6 +13,8 @@ import kotlin.math.sqrt
 
 object GlbSceneBuilder {
     const val BASE_PLATE_NODE = "baseplate"
+    const val BASE_PLATE_BOUNDARY_NODE = "baseplate_boundary"
+    const val BASE_PLATE_TEXT_NODE = "baseplate_brand_text"
     fun meshNodeName(index: Int): String = "mesh_$index"
     fun markerNodeName(index: Int): String = "marker_$index"
 
@@ -30,8 +32,8 @@ object GlbSceneBuilder {
         meshes: List<SceneMesh>,
         overrideColor: FloatArray?,
         colorOverrides: Map<MaterialSlotId, RgbaColor> = emptyMap(),
+        buildPlate: BuildPlateGeometry? = null,
     ): ByteBuffer {
-        val renderBounds = meshes.bounds()
         val modelColors = mutableListOf<FloatArray>()
         val materialBySlot = linkedMapOf<MaterialSlotId, Int>()
         var vertexColorMaterial: Int? = null
@@ -86,12 +88,29 @@ object GlbSceneBuilder {
             }
             meshDefinitions += MeshDefinition(meshNodeName(index), primitives)
         }
-        val basePlateMaterial = modelColors.size
-        val markerMaterialStart = basePlateMaterial + 1
-        meshDefinitions += MeshDefinition(
-            BASE_PLATE_NODE,
-            listOf(Primitive(basePlateVertices(renderBounds), intArrayOf(0, 1, 2, 0, 2, 3), basePlateMaterial, 4)),
-        )
+        buildPlate?.let { plate ->
+            var plateMaterial = modelColors.size
+            modelColors += plate.physicalPlate.color
+            meshDefinitions += MeshDefinition(
+                BASE_PLATE_NODE,
+                listOf(Primitive(plate.physicalPlate.vertices, plate.physicalPlate.indices, plateMaterial++, 4)),
+            )
+            plate.boundary?.let { boundary ->
+                modelColors += boundary.color
+                meshDefinitions += MeshDefinition(
+                    BASE_PLATE_BOUNDARY_NODE,
+                    listOf(Primitive(boundary.vertices, boundary.indices, plateMaterial++, 4)),
+                )
+            }
+            plate.brandText?.let { text ->
+                modelColors += text.color
+                meshDefinitions += MeshDefinition(
+                    BASE_PLATE_TEXT_NODE,
+                    listOf(Primitive(text.vertices, text.indices, plateMaterial++, 4)),
+                )
+            }
+        }
+        val markerMaterialStart = modelColors.size
         meshes.forEachIndexed { index, mesh ->
             meshDefinitions += MeshDefinition(
                 markerNodeName(index),
@@ -210,7 +229,9 @@ object GlbSceneBuilder {
             }
         }
         val modelMaterials = modelColors.joinToString(",") { color ->
-            "{\"pbrMetallicRoughness\":{\"baseColorFactor\":${color.srgbToLinearRgba().toJsonArray()},\"metallicFactor\":$MODEL_METALLIC,\"roughnessFactor\":$MODEL_ROUGHNESS},\"doubleSided\":true}"
+            val linear = color.srgbToLinearRgba()
+            val alphaMode = if (linear.size > 3 && linear[3] < 0.999f) ",\"alphaMode\":\"BLEND\"" else ""
+            "{\"pbrMetallicRoughness\":{\"baseColorFactor\":${linear.toJsonArray()},\"metallicFactor\":$MODEL_METALLIC,\"roughnessFactor\":$MODEL_ROUGHNESS},\"extensions\":$CLEARCOAT_EXTENSION,\"doubleSided\":true$alphaMode}"
         }
         val fixedMaterials = """
             {"pbrMetallicRoughness":{"baseColorFactor":[0.68,0.70,0.72,0.8],"metallicFactor":0,"roughnessFactor":0.9},"alphaMode":"BLEND","doubleSided":true},
@@ -220,7 +241,7 @@ object GlbSceneBuilder {
         """.trimIndent()
         return """
             {
-              "asset":{"version":"2.0","generator":"FilamentPreview lib3mf"},
+              "asset":{"version":"2.0","generator":"FilamentPreview lib3mf","extensionsUsed":["KHR_materials_clearcoat","KHR_materials_ior"]},
               "scene":0,
               "scenes":[{"nodes":$sceneNodes}],
               "nodes":$nodesJson,
@@ -297,25 +318,6 @@ object GlbSceneBuilder {
         x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0,
         x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
     )
-
-    private fun basePlateVertices(bounds: Bounds): FloatArray {
-        val cx = bounds.center.x
-        val cy = bounds.center.y
-        val span = max(bounds.size.x, bounds.size.y)
-        val half = max(1.2f, span * 0.65f)
-        val z = bounds.min.z - max(0.025f, bounds.size.z * 0.03f)
-        return floatArrayOf(cx - half, cy - half, z, cx + half, cy - half, z, cx + half, cy + half, z, cx - half, cy + half, z)
-    }
-
-    private fun List<SceneMesh>.bounds(): Bounds {
-        var min = Vec3(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
-        var max = Vec3(Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY)
-        forEach {
-            min = Vec3(kotlin.math.min(min.x, it.renderBounds.min.x), kotlin.math.min(min.y, it.renderBounds.min.y), kotlin.math.min(min.z, it.renderBounds.min.z))
-            max = Vec3(kotlin.math.max(max.x, it.renderBounds.max.x), kotlin.math.max(max.y, it.renderBounds.max.y), kotlin.math.max(max.z, it.renderBounds.max.z))
-        }
-        return Bounds(min, max)
-    }
 
     private fun padded(bytes: ByteArray, padByte: Int): ByteArray {
         val paddedSize = paddedSize(bytes.size)
@@ -422,7 +424,10 @@ object GlbSceneBuilder {
     private data class Accessor(val bufferView: Int, val componentType: Int, val count: Int, val type: String, val bounds: Bounds?)
 
     internal const val MODEL_METALLIC = 0.0f
-    internal const val MODEL_ROUGHNESS = 0.38f
+    internal const val MODEL_ROUGHNESS = 0.28f
+    internal const val CLEARCOAT_EXTENSION =
+        "{\"KHR_materials_clearcoat\":{\"clearcoatFactor\":0.65,\"clearcoatRoughnessFactor\":0.08}," +
+            "\"KHR_materials_ior\":{\"ior\":1.6}}"
     // Retained as the explicit/test fallback; runtime meshes use an automatically estimated angle.
     internal const val MODEL_CREASE_ANGLE_DEGREES = 15.0f
 }

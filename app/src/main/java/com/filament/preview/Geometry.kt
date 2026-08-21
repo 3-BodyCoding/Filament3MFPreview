@@ -1,6 +1,5 @@
 package com.filament.preview
 
-import io.lib3mf.android.MeshData
 import kotlin.math.max
 import kotlin.math.min
 
@@ -76,8 +75,10 @@ fun List<SceneMesh>.selectedXyzLengths(selectedIndex: Int?): XyzLengths? =
 
 fun PlacedMeshData.placedBounds(): Bounds = mesh.vertices.computeBounds(transform, previewOffset)
 
+fun List<PlacedMeshData>.combinedPlacedBounds(): Bounds = computeCombinedPlacedBounds()
+
 fun List<PlacedMeshData>.placedNormalization(): Pair<Vec3, Float> {
-    val bounds = computeCombinedPlacedBounds()
+    val bounds = combinedPlacedBounds()
     val span = max(0.0001f, max(bounds.size.x, max(bounds.size.y, bounds.size.z)))
     return Vec3(bounds.center.x, bounds.center.y, bounds.min.z) to (2.0f / span)
 }

@@ -44,7 +44,9 @@ import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
@@ -116,10 +118,17 @@ class MainActivity : ComponentActivity() {
     private var colorVersion = 0
     @Volatile
     private var prewarmLoadId = 0
+    @Volatile
+    private var renderingEnabled = true
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
+            if (!renderingEnabled) return
             choreographer.postFrameCallback(this)
-            filamentScope.launch { modelViewer?.render(frameTimeNanos) }
+            filamentScope.launch {
+                if (!renderingEnabled) return@launch
+                val viewer = modelViewer ?: return@launch
+                viewer.render(frameTimeNanos)
+            }
             updateAxisLabels()
         }
     }
@@ -135,6 +144,9 @@ class MainActivity : ComponentActivity() {
     private var selectedIndex by mutableStateOf<Int?>(null)
     private var selectedIndices by mutableStateOf(emptySet<Int>())
     private var showBasePlate by mutableStateOf(true)
+    private var buildPlateConfig by mutableStateOf(BuildPlateConfig())
+    private var buildPlateVersion by mutableIntStateOf(0)
+    private var printAreaWarning by mutableStateOf<String?>(null)
     private var editableColors by mutableStateOf<List<EditableColorState>>(emptyList())
     private var basePlateEntities = IntArray(0)
     private var modelEntities = emptyList<IntArray>()
@@ -169,6 +181,14 @@ class MainActivity : ComponentActivity() {
         modelColorController.resetAllColors()
     }
 
+    private fun updateBuildPlateConfig(config: BuildPlateConfig) {
+        if (config == buildPlateConfig) return
+        buildPlateConfig = config
+        buildPlateVersion++
+        viewCache.clear()
+        if (loadedPlacedMeshes.isNotEmpty()) reloadModel()
+    }
+
     private fun refreshEditableColors() {
         editableColors = modelColorController.getColorSlots().map { slot ->
             EditableColorState(
@@ -190,11 +210,13 @@ class MainActivity : ComponentActivity() {
                     selectedName = selectedIndex?.let { meshes.getOrNull(it)?.name },
                     selectedLengths = meshes.selectedXyzLengths(selectedIndex),
                     showBasePlate = showBasePlate,
+                    buildPlateConfig = buildPlateConfig,
                     editableColors = editableColors,
                     previewMode = previewMode,
                     plates = plates,
                     selectedPlateIndex = selectedPlateIndex,
                     axisLabels = axisLabels,
+                    printAreaWarning = printAreaWarning,
                     onPickFile = ::load3mf,
                     onColorChange = ::setEditableColor,
                     onColorReset = ::resetEditableColor,
@@ -202,6 +224,7 @@ class MainActivity : ComponentActivity() {
                     onPreviewModeChange = { mode -> previewMode = mode; applyCurrentPreview() },
                     onPlateChange = { index -> selectedPlateIndex = index; applyCurrentPreview() },
                     onBasePlateChange = { showBasePlate = it; applyBasePlateVisibility() },
+                    onBuildPlateConfigChange = ::updateBuildPlateConfig,
                     surfaceFactory = { surface -> setupFilament(surface) },
                 )
             }
@@ -210,6 +233,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        renderingEnabled = false
         modelBuildGeneration.incrementAndGet()
         modelBuildExecutor.shutdownNow()
         viewPrebuildExecutor.shutdownNow()
@@ -377,6 +401,7 @@ class MainActivity : ComponentActivity() {
         selectedIndices = emptySet()
         modelColorController.clearForNewModel()
         editableColors = emptyList()
+        printAreaWarning = null
         thread(name = "3mf-loader") {
             runCatching {
                 val source = copyToCache(uri)
@@ -560,14 +585,13 @@ class MainActivity : ComponentActivity() {
         selectedIndex = null
         selectedIndices = emptySet()
         requestModelBuild(
-            sceneMeshes = {
+            scenePreparation = {
                 val placed = when {
                     requestedMode == PreviewMode.Plate && selectedPlate != null -> selectedPlate.meshes
                     currentPlates.size >= 2 -> allPlacedMeshes.arrangedForAllPreview(currentPlates)
                     else -> allPlacedMeshes
                 }
-                runCatching { placed.toSceneMeshes() }
-                    .getOrElse { allPlacedMeshes.toSceneMeshes() }
+                prepareScene(placed)
             },
             replaceSceneMeshes = true,
             resetCamera = true,
@@ -578,29 +602,109 @@ class MainActivity : ComponentActivity() {
     private fun currentViewCacheKey(): String? {
         if (previewMode == PreviewMode.Plate) {
             val plate = plates.getOrNull(selectedPlateIndex) ?: return null
-            return "plate:${plate.index}:$colorVersion"
+            return "plate:${plate.index}:bp:$buildPlateVersion:$colorVersion"
         }
-        return "all:$colorVersion"
+        return "all:bp:$buildPlateVersion:$colorVersion"
     }
 
-    private fun List<PlacedMeshData>.toSceneMeshes(): List<SceneMesh> {
+    private fun List<PlacedMeshData>.toSceneMeshes(): List<SceneMesh> =
+        prepareScene(this).meshes
+
+    private fun List<PlacedMeshData>.toSceneMeshes(normalization: SceneNormalization): List<SceneMesh> {
         if (isEmpty()) return emptyList()
-        val (center, scale) = placedNormalization()
+        val modelBounds = combinedPlacedBounds()
+        val dropZ = -modelBounds.min.z
+        val center = normalization.center
+        val scale = normalization.scale
         val topLevelCounts = groupingBy { it.topLevelObjectId }.eachCount()
         Log.d("ThreeMfDebug", "toSceneMeshes: placed=${size}, topLevelCounts=$topLevelCounts")
         return flatMap { placed ->
+            val dropped = if (dropZ != 0f) {
+                placed.copy(previewOffset = placed.previewOffset.copy(z = placed.previewOffset.z + dropZ))
+            } else {
+                placed
+            }
             Log.d(
                 "ThreeMfDebug",
                 "Filament mesh: objectId=${placed.mesh.objectId} " +
                     "topLevelObjectId=${placed.topLevelObjectId} " +
                     "componentPath=${placed.objectPath.joinToString(" -> ")} " +
                     "world3mf=${placed.transform.debugString()} " +
-                    "finalFilament=${placed.transform.toFilamentMatrix(center, scale, placed.previewOffset).debugMatrix()} " +
+                    "finalFilament=${placed.transform.toFilamentMatrix(center, scale, dropped.previewOffset).debugMatrix()} " +
                     "nodeTransform=identity (transform baked into POSITION)",
             )
             // Plate and all-preview layouts share MeshData, so source vertices must remain immutable.
-            placed.toSceneMeshes(center, scale)
+            dropped.toSceneMeshes(center, scale)
         }
+    }
+
+    private fun prepareScene(placed: List<PlacedMeshData>): ScenePreparation {
+        if (placed.isEmpty()) {
+            val normalization = currentSceneNormalization(emptyList())
+            return ScenePreparation(emptyList(), emptyList(), normalization, null)
+        }
+        val normalization = currentSceneNormalization(placed)
+        val meshes = runCatching { placed.toSceneMeshes(normalization) }
+            .getOrElse { emptyList() }
+        val buildPlate = runCatching { createBuildPlateGeometry(placed, normalization) }.getOrNull()
+        val printAreaCheck = if (placed.isNotEmpty()) {
+            placed.printAreaCheck(buildPlateConfig, normalization.center.x, normalization.center.y)
+        } else {
+            null
+        }
+        return ScenePreparation(placed, meshes, normalization, buildPlate, printAreaCheck)
+    }
+
+    private fun currentSceneNormalization(placed: List<PlacedMeshData>): SceneNormalization {
+        val config = buildPlateConfig
+        if (placed.isEmpty()) {
+            val span = maxOf(
+                config.widthMm,
+                config.depthMm + config.frontExtensionMm + 1f,
+                config.thicknessMm * 2f,
+            )
+            return SceneNormalization(Vec3(0f, 0f, 0f), 2f / span)
+        }
+        val modelBounds = placed.combinedPlacedBounds()
+        val centerX = modelBounds.center.x
+        val centerY = modelBounds.center.y
+        val hw = config.widthMm / 2f
+        val hd = config.depthMm / 2f
+        val plateMinX = centerX - hw
+        val plateMaxX = centerX + hw
+        val plateMinY = centerY - hd - config.frontExtensionMm
+        val plateMaxY = centerY + hd
+        val modelDroppedMinZ = 0f
+        val modelDroppedMaxZ = modelBounds.size.z
+        val allMinX = minOf(modelBounds.min.x, plateMinX)
+        val allMaxX = maxOf(modelBounds.max.x, plateMaxX)
+        val allMinY = minOf(modelBounds.min.y, plateMinY)
+        val allMaxY = maxOf(modelBounds.max.y, plateMaxY)
+        val allMinZ = minOf(modelDroppedMinZ, -config.thicknessMm)
+        val allMaxZ = maxOf(modelDroppedMaxZ, 0f)
+        val combined = Bounds(
+            Vec3(allMinX, allMinY, allMinZ),
+            Vec3(allMaxX, allMaxY, allMaxZ),
+        )
+        val span = maxOf(0.0001f, combined.size.x, combined.size.y, combined.size.z)
+        return SceneNormalization(
+            center = Vec3(centerX, centerY, 0f),
+            scale = 2f / span,
+        )
+    }
+
+    private fun createBuildPlateGeometry(
+        placed: List<PlacedMeshData>,
+        normalization: SceneNormalization,
+    ): BuildPlateGeometry? {
+        val config = buildPlateConfig
+        val text = config.effectiveBrandText()
+        val outlines = if (text.isNotEmpty()) {
+            AndroidTextOutlineProvider().outlines(text, 96f)
+        } else {
+            emptyList()
+        }
+        return BuildPlateMeshGenerator.generate(config, normalization, outlines)
     }
 
     private fun FloatArray.debugMatrix(): String {
@@ -641,7 +745,15 @@ class MainActivity : ComponentActivity() {
         modelColorController.replaceAvailableSlots(currentMeshes)
         refreshEditableColors()
         requestModelBuild(
-            sceneMeshes = { currentMeshes },
+            scenePreparation = {
+                prepareScene(loadedPlacedMeshes.ifEmpty { emptyList() }.let { placed ->
+                    when {
+                        previewMode == PreviewMode.Plate -> plates.getOrNull(selectedPlateIndex)?.meshes ?: placed
+                        plates.size >= 2 -> placed.arrangedForAllPreview(plates)
+                        else -> placed
+                    }
+                })
+            },
             replaceSceneMeshes = false,
             resetCamera = false,
             cacheKey = currentViewCacheKey(),
@@ -649,7 +761,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestModelBuild(
-        sceneMeshes: () -> List<SceneMesh>,
+        scenePreparation: () -> ScenePreparation,
         replaceSceneMeshes: Boolean,
         resetCamera: Boolean,
         cacheKey: String? = null,
@@ -670,17 +782,19 @@ class MainActivity : ComponentActivity() {
             if (requestId != modelBuildGeneration.get()) return@modelBuild
             val prepared = runCatching {
                 val transformStart = System.currentTimeMillis()
-                val preparedMeshes = sceneMeshes()
+                val preparation = scenePreparation()
+                val preparedMeshes = preparation.meshes
                 val transformDone = System.currentTimeMillis()
                 if (requestId != modelBuildGeneration.get()) return@modelBuild
                 val glb = preparedMeshes.takeIf { it.isNotEmpty() }?.let {
-                    GlbSceneBuilder.build(it, null, colorOverrides)
+                    GlbSceneBuilder.build(it, null, colorOverrides, preparation.buildPlate)
                 }
                 PreparedModel(
                     meshes = preparedMeshes,
                     glb = glb,
                     transformMs = transformDone - transformStart,
                     buildMs = System.currentTimeMillis() - transformDone,
+                    printAreaCheck = preparation.printAreaCheck,
                 )
             }
             runOnUiThread {
@@ -712,6 +826,9 @@ class MainActivity : ComponentActivity() {
         refreshEditableColors()
         if (resetCamera) resetOrbitCamera()
         applyPreparedModel(model, requestedAt)
+        printAreaWarning = model.printAreaCheck?.takeIf { !it.isInside }?.let {
+            getString(R.string.warn_out_of_print_area)
+        }
         updateStatus()
         if (fromCache) {
             Log.d("ThreeMfPerf", "view cache hit: ${model.meshes.size} meshes")
@@ -723,10 +840,10 @@ class MainActivity : ComponentActivity() {
         val placedSnapshot = loadedPlacedMeshes
         val currentKey = currentViewCacheKey()
         val keys = buildList {
-            val allKey = "all:$colorVersion"
+            val allKey = "all:bp:$buildPlateVersion:$colorVersion"
             if (allKey != currentKey) add(allKey)
             platesSnapshot.forEach { plate ->
-                val key = "plate:${plate.index}:$colorVersion"
+                val key = "plate:${plate.index}:bp:$buildPlateVersion:$colorVersion"
                 if (key != currentKey) add(key)
             }
         }.distinct()
@@ -747,13 +864,21 @@ class MainActivity : ComponentActivity() {
                     else -> placedSnapshot.arrangedForAllPreview(platesSnapshot)
                 }
                 if (placed.isEmpty()) continue
-                val sceneMeshes = runCatching { placed.toSceneMeshes() }.getOrNull() ?: continue
+                val preparation = runCatching { prepareScene(placed) }.getOrNull() ?: continue
                 if (modelBuildGeneration.get() != buildGeneration) break
                 if (version != colorVersion || loadId != prewarmLoadId) break
-                val glb = runCatching { GlbSceneBuilder.build(sceneMeshes, null, colorOverrides) }.getOrNull() ?: continue
+                val glb = runCatching {
+                    GlbSceneBuilder.build(preparation.meshes, null, colorOverrides, preparation.buildPlate)
+                }.getOrNull() ?: continue
                 if (modelBuildGeneration.get() != buildGeneration) break
                 if (version != colorVersion || loadId != prewarmLoadId) break
-                viewCache[key] = PreparedModel(sceneMeshes, glb, 0L, 0L)
+                viewCache[key] = PreparedModel(
+                    meshes = preparation.meshes,
+                    glb = glb,
+                    transformMs = 0L,
+                    buildMs = 0L,
+                    printAreaCheck = preparation.printAreaCheck,
+                )
             }
         }
     }
@@ -788,6 +913,9 @@ class MainActivity : ComponentActivity() {
         }
         viewer.view.multiSampleAntiAliasingOptions = msaa
         viewer.view.antiAliasing = View.AntiAliasing.FXAA
+        viewer.view.temporalAntiAliasingOptions = View.TemporalAntiAliasingOptions().apply {
+            enabled = true
+        }
         viewer.view.ambientOcclusionOptions = View.AmbientOcclusionOptions().apply {
             enabled = true
             // Scene geometry is normalized to a maximum span of 2, so keep AO local to small cavities.
@@ -814,9 +942,14 @@ class MainActivity : ComponentActivity() {
         val asset = modelViewer?.asset ?: return
         val renderables = asset.renderableEntities
         val renderablesByName = renderables.groupBy { entity -> asset.getName(entity) }
-        basePlateEntities = renderablesByName[GlbSceneBuilder.BASE_PLATE_NODE]?.toIntArray()
-            ?: renderables.getOrNull(meshes.size)?.let { intArrayOf(it) }
-            ?: asset.getEntitiesByName(GlbSceneBuilder.BASE_PLATE_NODE)
+        val plateNames = listOf(
+            GlbSceneBuilder.BASE_PLATE_NODE,
+            GlbSceneBuilder.BASE_PLATE_BOUNDARY_NODE,
+            GlbSceneBuilder.BASE_PLATE_TEXT_NODE,
+        )
+        basePlateEntities = plateNames.flatMap { name ->
+            renderablesByName[name] ?: asset.getEntitiesByName(name).toList()
+        }.toIntArray()
         modelEntities = meshes.indices.map { index ->
             renderablesByName[GlbSceneBuilder.meshNodeName(index)]?.toIntArray()
                 ?: renderables.getOrNull(index)?.let { intArrayOf(it) }
@@ -1035,6 +1168,15 @@ private data class PreparedModel(
     val glb: ByteBuffer?,
     val transformMs: Long,
     val buildMs: Long,
+    val printAreaCheck: PrintAreaCheck? = null,
+)
+
+private data class ScenePreparation(
+    val placed: List<PlacedMeshData>,
+    val meshes: List<SceneMesh>,
+    val normalization: SceneNormalization,
+    val buildPlate: BuildPlateGeometry?,
+    val printAreaCheck: PrintAreaCheck? = null,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1045,11 +1187,13 @@ private fun PreviewScreen(
     selectedName: String?,
     selectedLengths: XyzLengths?,
     showBasePlate: Boolean,
+    buildPlateConfig: BuildPlateConfig,
     editableColors: List<EditableColorState>,
     previewMode: PreviewMode,
     plates: List<PlatePreview>,
     selectedPlateIndex: Int,
     axisLabels: List<AxisLabel>,
+    printAreaWarning: String?,
     onPickFile: (Uri) -> Unit,
     onColorChange: (MaterialSlotId, RgbaColor) -> Unit,
     onColorReset: (MaterialSlotId) -> Unit,
@@ -1057,6 +1201,7 @@ private fun PreviewScreen(
     onPreviewModeChange: (PreviewMode) -> Unit,
     onPlateChange: (Int) -> Unit,
     onBasePlateChange: (Boolean) -> Unit,
+    onBuildPlateConfigChange: (BuildPlateConfig) -> Unit,
     surfaceFactory: (SurfaceView) -> Unit,
 ) {
     val context = LocalContext.current
@@ -1065,6 +1210,7 @@ private fun PreviewScreen(
     }
     var colorDialogOpen by remember { mutableStateOf(false) }
     var plateMenuExpanded by remember { mutableStateOf(false) }
+    var buildPlateDialogOpen by remember { mutableStateOf(false) }
 
     Scaffold { padding ->
         Box(
@@ -1181,6 +1327,19 @@ private fun PreviewScreen(
                         color = Color(0xFF475569)
                     )
                 }
+                printAreaWarning?.let { warning ->
+                    Text(
+                        text = warning,
+                        color = Color(0xFFDC2626),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Button(
+                    onClick = { buildPlateDialogOpen = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.label_build_plate_settings))
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1222,8 +1381,186 @@ private fun PreviewScreen(
                     onAllColorsReset = onAllColorsReset,
                 )
             }
+            if (buildPlateDialogOpen) {
+                BuildPlateSettingsDialog(
+                    config = buildPlateConfig,
+                    onDismiss = { buildPlateDialogOpen = false },
+                    onConfirm = { newConfig ->
+                        onBuildPlateConfigChange(newConfig)
+                        buildPlateDialogOpen = false
+                    },
+                )
+            }
         }
     }
+}
+
+@Composable
+private fun BuildPlateSettingsDialog(
+    config: BuildPlateConfig,
+    onDismiss: () -> Unit,
+    onConfirm: (BuildPlateConfig) -> Unit,
+) {
+    var widthText by remember { mutableStateOf(config.widthMm.format()) }
+    var depthText by remember { mutableStateOf(config.depthMm.format()) }
+    var frontExtensionText by remember { mutableStateOf(config.frontExtensionMm.format()) }
+    var brandWidthText by remember { mutableStateOf(config.brandAreaWidthMm.format()) }
+    var brandFrontWidthText by remember { mutableStateOf(config.brandAreaFrontWidthMm.format()) }
+    var brandText by remember { mutableStateOf(config.brandText) }
+    var plateColor by remember { mutableStateOf(config.plateColor.copyOf()) }
+    var alpha by remember { mutableStateOf(if (config.plateColor.size > 3) config.plateColor[3] else 1f) }
+
+    fun channel(index: Int, default: Float): Float =
+        if (plateColor.size > index) plateColor[index] else default
+
+    fun currentColor(): RgbaColor = RgbaColor(
+        channel(0, 0f),
+        channel(1, 0f),
+        channel(2, 0f),
+        alpha.coerceIn(0f, 1f),
+    )
+
+    fun buildConfig(): BuildPlateConfig {
+        val width = widthText.toFloatOrNull()?.takeIf { it > 0f } ?: config.widthMm
+        val depth = depthText.toFloatOrNull()?.takeIf { it > 0f } ?: config.depthMm
+        val front = frontExtensionText.toFloatOrNull()?.takeIf { it >= 0f } ?: config.frontExtensionMm
+        val brandWidth = brandWidthText.toFloatOrNull()?.takeIf { it > 0f } ?: config.brandAreaWidthMm
+        val brandFront = brandFrontWidthText.toFloatOrNull()?.takeIf { it > 0f } ?: config.brandAreaFrontWidthMm
+        val newColor = floatArrayOf(
+            channel(0, 0f),
+            channel(1, 0f),
+            channel(2, 0f),
+            alpha.coerceIn(0f, 1f),
+        )
+        return config.copy(
+            widthMm = width,
+            depthMm = depth,
+            frontExtensionMm = front,
+            brandAreaWidthMm = brandWidth,
+            brandAreaFrontWidthMm = brandFront,
+            brandText = brandText,
+            plateColor = newColor,
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.label_build_plate_settings)) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(180f, 256f, 300f, 350f).forEach { preset ->
+                        Button(
+                            onClick = {
+                                widthText = preset.format()
+                                depthText = preset.format()
+                            },
+                            modifier = Modifier.height(32.dp),
+                        ) {
+                            Text("${preset.toInt()}")
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = widthText,
+                    onValueChange = { widthText = it },
+                    label = { Text(stringResource(R.string.label_plate_width)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = depthText,
+                    onValueChange = { depthText = it },
+                    label = { Text(stringResource(R.string.label_plate_depth)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = frontExtensionText,
+                    onValueChange = { frontExtensionText = it },
+                    label = { Text(stringResource(R.string.label_plate_front_extension)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = brandWidthText,
+                    onValueChange = { brandWidthText = it },
+                    label = { Text(stringResource(R.string.label_brand_area_width)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = brandFrontWidthText,
+                    onValueChange = { brandFrontWidthText = it },
+                    label = { Text(stringResource(R.string.label_brand_front_width)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = brandText,
+                    onValueChange = { brandText = it },
+                    label = { Text(stringResource(R.string.label_brand_text)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Text(
+                    text = stringResource(R.string.label_plate_color),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    MainActivity.EDITOR_COLORS.take(6).forEach { palette ->
+                        PaletteColorButton(
+                            palette = palette,
+                            selected = palette.color.red == channel(0, 0f) &&
+                                palette.color.green == channel(1, 0f) &&
+                                palette.color.blue == channel(2, 0f),
+                            onClick = {
+                                plateColor = floatArrayOf(
+                                    palette.color.red,
+                                    palette.color.green,
+                                    palette.color.blue,
+                                    alpha.coerceIn(0f, 1f),
+                                )
+                            },
+                        )
+                    }
+                }
+                Text(
+                    text = stringResource(R.string.label_opacity) + " ${(alpha.coerceIn(0f, 1f) * 100).roundToInt()}%",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Slider(
+                    value = alpha.coerceIn(0f, 1f),
+                    onValueChange = { alpha = it },
+                    valueRange = 0f..1f,
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(36.dp)
+                        .background(currentColor().toComposeColor(), RoundedCornerShape(8.dp))
+                        .border(1.dp, Color(0xFFCBD5E1), RoundedCornerShape(8.dp)),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(buildConfig()) }) {
+                Text(stringResource(R.string.btn_done))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.btn_cancel))
+            }
+        },
+    )
 }
 
 @Composable

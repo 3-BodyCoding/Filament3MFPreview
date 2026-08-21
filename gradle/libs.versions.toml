@@ -10,6 +10,7 @@ activityCompose = "1.13.0"
 kotlin = "2.4.10"
 composeBom = "2026.08.00"
 filament = "1.75.0"
+earcut4j = "3.0.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -31,6 +32,7 @@ filament = { group = "com.google.android.filament", name = "filament-android", v
 filament-gltfio = { group = "com.google.android.filament", name = "gltfio-android", version.ref = "filament" }
 filament-utils = { group = "com.google.android.filament", name = "filament-utils-android", version.ref = "filament" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutinesCore" }
+earcut4j = { group = "org.maplibre", name = "earcut4j", version.ref = "earcut4j" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

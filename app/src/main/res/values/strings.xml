@@ -23,6 +23,18 @@
     <string name="dropdown_current_plate">Current plate</string>
     <string name="label_all_plates_preview">Preview all plates together</string>
     <string name="label_base_plate">Base plate</string>
+    <string name="label_build_plate">Build Plate</string>
+    <string name="label_build_plate_settings">Build Plate Settings</string>
+    <string name="label_plate_width">Width (mm)</string>
+    <string name="label_plate_depth">Depth (mm)</string>
+    <string name="label_plate_front_extension">Front extension (mm)</string>
+    <string name="label_brand_area_width">Brand area width (mm)</string>
+    <string name="label_brand_front_width">Brand front width (mm)</string>
+    <string name="label_brand_text">Brand text</string>
+    <string name="label_plate_color">Plate color</string>
+    <string name="label_opacity">Opacity</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="warn_out_of_print_area">Some models are outside the print area</string>
     <string name="label_selected_info">Selected: %1$s  X=%2$s  Y=%3$s  Z=%4$s</string>
     <string name="hint_tap_model">Tap a model to show/hide red (X), green (Y), blue (Z) bounding lines</string>
     <string name="loading_3mf">Loading 3MF…</string>

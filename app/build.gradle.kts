@@ -46,6 +46,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.earcut4j)
     implementation(libs.filament)
     implementation(libs.filament.gltfio)
     implementation(libs.filament.utils)
