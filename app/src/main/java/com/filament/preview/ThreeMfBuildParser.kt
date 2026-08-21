@@ -29,6 +29,7 @@ data class PlacedMeshData(
     val objectPath: List<Int> = listOf(mesh.objectId),
     val transform: MeshTransform = MeshTransform.IDENTITY,
     val previewOffset: Vec3 = Vec3(0.0f, 0.0f, 0.0f),
+    val renderLiftZ: Float = 0f,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -46,6 +47,7 @@ data class PlacedMeshData(
         if (objectPath != other.objectPath) return false
         if (transform != other.transform) return false
         if (previewOffset != other.previewOffset) return false
+        if (renderLiftZ != other.renderLiftZ) return false
 
         return true
     }
@@ -61,6 +63,7 @@ data class PlacedMeshData(
         result = 31 * result + objectPath.hashCode()
         result = 31 * result + transform.hashCode()
         result = 31 * result + previewOffset.hashCode()
+        result = 31 * result + renderLiftZ.hashCode()
         return result
     }
 }

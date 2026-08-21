@@ -31,6 +31,7 @@
     <string name="label_brand_area_width">Brand area width (mm)</string>
     <string name="label_brand_front_width">Brand front width (mm)</string>
     <string name="label_brand_text">Brand text</string>
+    <string name="label_brand_text_size">Brand text size (mm)</string>
     <string name="label_plate_color">Plate color</string>
     <string name="label_opacity">Opacity</string>
     <string name="btn_cancel">Cancel</string>

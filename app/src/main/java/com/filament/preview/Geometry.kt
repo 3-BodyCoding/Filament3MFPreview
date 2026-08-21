@@ -2,6 +2,7 @@ package com.filament.preview
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /** Original 3MF-axis lengths for a selected object. */
 data class XyzLengths(val x: Float, val y: Float, val z: Float)
@@ -11,6 +12,19 @@ data class Vec3(val x: Float, val y: Float, val z: Float) {
     operator fun minus(other: Vec3) = Vec3(x - other.x, y - other.y, z - other.z)
     operator fun times(scale: Float) = Vec3(x * scale, y * scale, z * scale)
     fun dot(other: Vec3): Float = x * other.x + y * other.y + z * other.z
+}
+
+/** 叉积：用于计算右手坐标系中的法向量/方向。 */
+fun Vec3.cross(other: Vec3): Vec3 = Vec3(
+    y * other.z - z * other.y,
+    z * other.x - x * other.z,
+    x * other.y - y * other.x,
+)
+
+/** 归一化，长度过小时返回 fallback，避免除零。 */
+fun Vec3.normalizedOr(fallback: Vec3): Vec3 {
+    val length = sqrt(x * x + y * y + z * z)
+    return if (length > 1e-6f) Vec3(x / length, y / length, z / length) else fallback
 }
 
 data class Bounds(val min: Vec3, val max: Vec3) {
@@ -92,6 +106,7 @@ fun PlacedMeshData.toSceneMeshes(center: Vec3, scale: Float): List<SceneMesh> {
             sourceTriangles = mesh.triangles,
             transform = transform,
             previewOffset = previewOffset,
+            renderLiftZ = renderLiftZ,
             center = center,
             scale = scale,
         )
@@ -108,6 +123,7 @@ fun PlacedMeshData.toSceneMeshes(center: Vec3, scale: Float): List<SceneMesh> {
             sourceTriangles = component.triangles,
             transform = transform,
             previewOffset = previewOffset,
+            renderLiftZ = renderLiftZ,
             center = center,
             scale = scale,
         ).copy(displayColor = displayColor ?: mesh.displayColor, topLevelObjectId = topLevelObjectId)
@@ -121,6 +137,7 @@ private fun buildSceneMeshTransformed(
     sourceTriangles: IntArray,
     transform: MeshTransform,
     previewOffset: Vec3,
+    renderLiftZ: Float,
     center: Vec3,
     scale: Float,
 ): SceneMesh {
@@ -138,7 +155,8 @@ private fun buildSceneMeshTransformed(
         val sourceZ = sourceVertices[i + 2]
         val x = transform.transformX(sourceX, sourceY, sourceZ) + previewOffset.x
         val y = transform.transformY(sourceX, sourceY, sourceZ) + previewOffset.y
-        val z = transform.transformZ(sourceX, sourceY, sourceZ) + previewOffset.z
+        // renderLiftZ 是纯渲染附加偏移，不计入真实摆放位置。
+        val z = transform.transformZ(sourceX, sourceY, sourceZ) + previewOffset.z + renderLiftZ
         minX = min(minX, x); minY = min(minY, y); minZ = min(minZ, z)
         maxX = max(maxX, x); maxY = max(maxY, y); maxZ = max(maxZ, z)
         normalized[i] = (x - center.x) * scale
