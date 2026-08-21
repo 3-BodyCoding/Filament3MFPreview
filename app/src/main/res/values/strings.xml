@@ -27,6 +27,8 @@
     <string name="label_build_plate_settings">Build Plate Settings</string>
     <string name="label_plate_width">Width (mm)</string>
     <string name="label_plate_depth">Depth (mm)</string>
+    <string name="label_plate_size">Plate size</string>
+    <string name="dropdown_select_plate_size">Select plate size</string>
     <string name="label_plate_front_extension">Front extension (mm)</string>
     <string name="label_brand_area_width">Brand area width (mm)</string>
     <string name="label_brand_front_width">Brand front width (mm)</string>

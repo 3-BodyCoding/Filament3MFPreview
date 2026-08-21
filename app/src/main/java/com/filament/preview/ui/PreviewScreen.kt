@@ -7,7 +7,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -333,6 +332,7 @@ fun PreviewScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun BuildPlateSettingsDialog(
     config: BuildPlateConfig,
@@ -396,22 +396,52 @@ private fun BuildPlateSettingsDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                val plateSizes = listOf(
+                    180f to 180f,
+                    210f to 210f,
+                    220f to 220f,
+                    235f to 235f,
+                    256f to 256f,
+                    300f to 300f,
+                    350f to 350f,
+                )
+                val selectedPlateSize = plateSizes.firstOrNull { (w, d) ->
+                    w == (widthText.toFloatOrNull() ?: config.widthMm) &&
+                        d == (depthText.toFloatOrNull() ?: config.depthMm)
+                }
+                var sizeMenuExpanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(
+                    expanded = sizeMenuExpanded,
+                    onExpandedChange = { sizeMenuExpanded = it },
                 ) {
-                    listOf(180f, 256f, 300f, 350f).forEach { preset ->
-                        Button(
-                            onClick = {
-                                widthText = preset.format()
-                                depthText = preset.format()
-                            },
-                            modifier = Modifier
-                                .height(32.dp),
-                        ) {
-                            Text("${preset.toInt()}")
+                    OutlinedTextField(
+                        value = selectedPlateSize
+                            ?.let { (w, d) -> "${w.toInt()} × ${d.toInt()} mm" }
+                            ?: stringResource(R.string.dropdown_select_plate_size),
+                        onValueChange = {},
+                        readOnly = true,
+                        singleLine = true,
+                        label = { Text(stringResource(R.string.label_plate_size)) },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = sizeMenuExpanded)
+                        },
+                        modifier = Modifier
+                            .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                            .fillMaxWidth(),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = sizeMenuExpanded,
+                        onDismissRequest = { sizeMenuExpanded = false },
+                    ) {
+                        plateSizes.forEach { (w, d) ->
+                            DropdownMenuItem(
+                                text = { Text("${w.toInt()} × ${d.toInt()} mm") },
+                                onClick = {
+                                    widthText = w.format()
+                                    depthText = d.format()
+                                    sizeMenuExpanded = false
+                                },
+                            )
                         }
                     }
                 }
